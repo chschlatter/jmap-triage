@@ -1,0 +1,166 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  jmap-triage: polls Inbox/Triage, classifies with Claude Haiku on Bedrock,
+  moves mail, and notifies via Pushover. See
+  triage.ts-DEPLOY-v1-2026-08-02.md for the full design.
+
+Parameters:
+  BedrockModelId:
+    Type: String
+    Description: >
+      Current Claude Haiku model id (or cross-region inference profile id)
+      for eu-central-1 -- see README.md prereq 3. Not hardcoded because
+      Bedrock model ids change over time.
+  TriageMailboxId:
+    Type: String
+    Description: Inbox/Triage mailbox id (source).
+  InboxMailboxId:
+    Type: String
+    Description: Inbox mailbox id (destination for inbox).
+  InboxOrdersMailboxId:
+    Type: String
+    Description: Inbox/Orders mailbox id (destination for orders).
+  InboxNewsMailboxId:
+    Type: String
+    Description: Inbox/News mailbox id (destination for newsletters).
+  ArchiveNoiseMailboxId:
+    Type: String
+    Description: Archive/Noise mailbox id (destination for noise).
+  InboxSuspiciousMailboxId:
+    Type: String
+    Description: Inbox/Suspicious mailbox id (destination for suspicious).
+  FastmailTokenParam:
+    Type: String
+    Default: /jmap-triage/fastmail-token
+    Description: >
+      Name (not value) of the SecureString SSM parameter holding the
+      Fastmail API token. Create it out of band -- see README.md's Lambda
+      deployment section.
+  PushoverTokenParam:
+    Type: String
+    Default: /jmap-triage/pushover-token
+  PushoverUserParam:
+    Type: String
+    Default: /jmap-triage/pushover-user
+  ScheduleExpression:
+    Type: String
+    Default: rate(5 minutes)
+  ScheduleEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Leave "false" for the first deploy -- validate with a dry-run
+      `aws lambda invoke` (README's Lambda deployment section) before
+      redeploying with this set to "true" and going live on the schedule.
+      Gates the EventBridge rule's existence via a Condition (below), not
+      via the Schedule event's own `Enabled` property -- SAM's transform
+      hardcodes that property's resulting `State` to ENABLED regardless of
+      a Ref'd parameter, evaluating it at transform time before parameters
+      are resolved. Learned the hard way: see
+      triage.ts-DEPLOY-v1-2026-08-02.md §6.
+  Limit:
+    Type: Number
+    Default: 20
+    Description: Max messages fetched from Inbox/Triage per invocation.
+
+Conditions:
+  ScheduleIsEnabled: !Equals [!Ref ScheduleEnabled, "true"]
+
+Resources:
+  TriageFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Format: cjs
+        EntryPoints:
+          - src/lambda.ts
+    Properties:
+      Handler: src/lambda.handler
+      Runtime: nodejs24.x
+      Timeout: 240
+      MemorySize: 512
+      # No ReservedConcurrentExecutions: this account's Lambda concurrency
+      # limit in this region is only 10 (AWS default floor requires >=10
+      # *unreserved* to remain account-wide), so reserving even 1 is
+      # rejected at deploy time. See triage.ts-DEPLOY-v1-2026-08-02.md §6
+      # for the overlap-safety argument this was meant to enforce --
+      # revisit (reserve concurrency, or a lighter-weight lock) once/if the
+      # account's concurrency quota is raised.
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          TRIAGE_MAILBOX_ID: !Ref TriageMailboxId
+          INBOX_MAILBOX_ID: !Ref InboxMailboxId
+          INBOX_ORDERS_MAILBOX_ID: !Ref InboxOrdersMailboxId
+          INBOX_NEWS_MAILBOX_ID: !Ref InboxNewsMailboxId
+          ARCHIVE_NOISE_MAILBOX_ID: !Ref ArchiveNoiseMailboxId
+          INBOX_SUSPICIOUS_MAILBOX_ID: !Ref InboxSuspiciousMailboxId
+          LIMIT: !Ref Limit
+          FASTMAIL_TOKEN_PARAM: !Ref FastmailTokenParam
+          PUSHOVER_TOKEN_PARAM: !Ref PushoverTokenParam
+          PUSHOVER_USER_PARAM: !Ref PushoverUserParam
+      Policies:
+        - Statement:
+            - Sid: InvokeBedrockHaiku
+              Effect: Allow
+              Action: bedrock:InvokeModel
+              # BedrockModelId is a cross-region inference profile (e.g.
+              # eu.anthropic.claude-haiku-4-5-...), not a directly-invokable
+              # model id -- Bedrock checks IAM permission on *both* the
+              # inference-profile ARN (this account/region) and the
+              # underlying foundation-model ARN in whichever region the
+              # profile routes to, which for an "eu."-prefixed profile can
+              # be any EU region, not just where this stack is deployed.
+              # Narrowed off "*" only insofar as region/account go --
+              # narrowing to the specific model id itself is deferred, see
+              # triage.ts-DEPLOY-v1-2026-08-02.md §10.
+              Resource:
+                - !Sub arn:aws:bedrock:*::foundation-model/*
+                - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*
+            - Sid: ReadTriageSecrets
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              # Param name Parameters (FastmailTokenParam etc.) already
+              # include their leading "/" -- concatenated directly onto
+              # "parameter" per the SSM ARN format, not "parameter/${name}".
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${FastmailTokenParam}
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PushoverTokenParam}
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PushoverUserParam}
+
+  # Defined as raw CloudFormation, not SAM's `Events: Schedule:` shorthand
+  # -- that shorthand's EventSource schema only allows Type/Properties, no
+  # Condition key, so it can't be gated by ScheduleEnabled at all (see the
+  # parameter's own description). A plain resource-level Condition is
+  # universally supported, so the toggle lives here instead: when
+  # ScheduleEnabled=false, neither this rule nor its invoke permission
+  # exist in the stack.
+  TriageSchedule:
+    Type: AWS::Events::Rule
+    Condition: ScheduleIsEnabled
+    Properties:
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt TriageFunction.Arn
+          Id: TriageFunctionScheduleTarget
+
+  TriageScheduleInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: ScheduleIsEnabled
+    Properties:
+      FunctionName: !Ref TriageFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TriageSchedule.Arn
+
+Outputs:
+  TriageFunctionArn:
+    Value: !GetAtt TriageFunction.Arn
