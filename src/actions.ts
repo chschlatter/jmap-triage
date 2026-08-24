@@ -6,7 +6,6 @@ import { CORE, MAIL, jmapRequest, type Session } from "./jmap-session.js";
 import { MAILBOX_SPECS, type MailboxRefs } from "./mailboxes.js";
 import type { TriageEmail } from "./fetch-emails.js";
 import type { ClassificationOutcome } from "./classify.js";
-import { PROMPT_VERSION } from "../prompt.js";
 
 // Below typical JMAP server maxObjectsInSet limits -- confirm against
 // session.capabilities["urn:ietf:params:jmap:core"].maxObjectsInSet if this
@@ -69,22 +68,30 @@ export interface SkippedEmail {
   reason: string;
 }
 
-function aiKeywordFor(category: string): string {
-  return `$ai-${PROMPT_VERSION}-${category}`;
+function aiKeywordFor(promptVersion: string, category: string): string {
+  return `$ai-${promptVersion}-${category}`;
 }
 
-function aiNotifiedKeyword(): string {
-  return `$ai-${PROMPT_VERSION}-notified`;
+function aiNotifiedKeyword(promptVersion: string): string {
+  return `$ai-${promptVersion}-notified`;
 }
 
 // Pure planning step -- no writes. A classification failure, or a category
 // string the mapping doesn't recognize, is skipped rather than moved: the
 // email is simply left in Inbox/Triage for the next run (or a human) to
 // deal with.
+//
+// promptVersion is the version that actually produced `outcomes` -- passed
+// in rather than imported from prompt.ts, so the keyword stamped on each
+// email always matches the prompt that classified it, whether that's the
+// bundled prompt.ts (CLI) or a version fetched from S3 at runtime (Lambda,
+// see lambda.ts). See jmap-triage-mcp-proposal-v4.md's S3-source-of-truth
+// migration.
 export function planActions(
   emails: TriageEmail[],
   outcomes: ClassificationOutcome[],
-  destinations: Record<string, Destination>
+  destinations: Record<string, Destination>,
+  promptVersion: string
 ): { planned: PlannedAction[]; skipped: SkippedEmail[] } {
   const emailById = new Map(emails.map((e) => [e.id, e]));
   const planned: PlannedAction[] = [];
@@ -110,8 +117,8 @@ export function planActions(
       category: outcome.category,
       notify: outcome.notify,
       destination,
-      keyword: aiKeywordFor(outcome.category),
-      notifiedKeyword: aiNotifiedKeyword(),
+      keyword: aiKeywordFor(promptVersion, outcome.category),
+      notifiedKeyword: aiNotifiedKeyword(promptVersion),
     });
   }
 

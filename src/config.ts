@@ -97,6 +97,22 @@ export function requirePushoverConfig(): PushoverConfig {
   return { token, user };
 }
 
+// S3 bucket holding current.json / history/* (jmap-triage-mcp-proposal-v4.md).
+// Read by the Lambda pipeline's cold-start prompt fetch (lambda.ts,
+// current-prompt.ts) and by every jmap-triage-mcp tool. One bucket, one env
+// var name, shared by both deployables -- see template.yaml.
+export function requirePromptBucket(): string {
+  const bucket = process.env.PROMPT_BUCKET;
+  if (!bucket) {
+    throw new Error(
+      "Error: PROMPT_BUCKET environment variable is not set.\n" +
+        "This is the S3 bucket holding current.json and history/* -- see\n" +
+        "jmap-triage-mcp-proposal-v4.md's S3 layout section."
+    );
+  }
+  return bucket;
+}
+
 export type { MailboxOverrides };
 
 // Each override skips one Mailbox/query lookup and uses the given id

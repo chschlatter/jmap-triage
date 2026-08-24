@@ -1,69 +1,55 @@
-# triage.ts — Design Document (v5)
+# triage.ts — Design Document
 
-Status: v5 (implemented). Last updated 2026-08-02.
+Status: implemented. Last updated 2026-08-20 (classification prompt at
+`PROMPT_VERSION = "v7"`; see `prompt.ts`'s own version-history comment for
+how the prompt got here — that history isn't repeated in this doc).
 
-> **2026-08-07 note**: the *mechanism* this doc describes (mailbox
-> resolution, patch-style moves, keyword tagging, dry-run-by-default) is
-> still current. Two things it hardcodes from v5's implementation moment are
-> not: the category set (`attention`/`keep`/`suspicious`/`newsletters`/
-> `noise`, prompt.ts v4) and the notify-by-category table (§2, §3.4). Both
-> moved on through prompt.ts v5-v7 — `attention`+`keep` merged into `inbox`,
-> `orders` was added with its own mailbox (six mailboxes now, not four/five),
-> and `notify` became a per-message model decision no longer gated by
-> category in code. See `prompt.ts`'s own version-history comment for the
-> category rationale and `src/actions.ts`/`src/notify.ts` for current
-> mechanism-level details. Tables below are left as-is as the historical
-> record of the v5 decision, not corrected in place.
-
-Builds on `triage.ts-DESIGN-v4-2026-08-02.md` (prior implementation: v4,
-classification-only, zero writes). v5 adds the action layer v4 explicitly
-deferred, adds Pushover notifications, tags each classified email with a
-keyword for a future learning stage, and splits the current monolithic
-`triage.ts` into functional modules. This doc doesn't repeat v4's rationale
-for the classification stage (fetch shape, prompt, categories) — that stage
-is unchanged in v5 except for one addition (`PROMPT_VERSION`, §3.6). It
-covers only what's new: acting on a classification, notifying about it,
-tagging it for later comparison, and the code reorganization needed to hold
-all three without `triage.ts` becoming unreadable.
+> **2026-08-20 note**: `src/lambda.ts`'s cold start now fetches the live
+> prompt from S3 (`current.json`), caching it across warm invocations and
+> falling back to the bundled `prompt.ts`/`PROMPT_VERSION` (§3.6 below) if
+> that fetch fails — `classifyBatch` (§3.1) and `planActions` (§3.6) were
+> parameterized accordingly. The CLI path is unchanged: it still classifies
+> with the bundled prompt directly. This is what makes `jmap-triage-mcp`'s
+> `approve_prompt_diff` actually change production behavior instead of only
+> writing a record nothing reads. See `docs/jmap-triage-mcp-proposal-v4.md`.
 
 ## 1. Purpose
 
-v4 polls `/Inbox/Triage`, classifies each message, and prints a table. It
-makes no changes to the mailbox — deliberately, so classification quality
-could be validated against real mail before anything touched the account.
-That validation has now happened (v4 §9). v5 closes the loop:
+`triage.ts` polls `Inbox/Triage` (populated by a separate, already-configured
+Sieve catch-all rule), classifies each message with Claude Haiku on AWS
+Bedrock, and closes the loop by acting on that classification:
 
 ```
-┌──────────────┐   ┌────────────┐   ┌────────────────┐   ┌──────────────────────────┐
-│ Incoming mail│-->│ Sieve      │-->│ Inbox/Triage   │-->│ triage.ts                │
-│              │   │ catch-all  │   │ mailbox        │   │  1. classify (v4, as-is) │
-└──────────────┘   └────────────┘   └────────────────┘   │  2. act: move   (v5, new)│
-                                                          │  3. notify       (v5, new)│
-                                                          └────────────┬─────────────┘
+┌──────────────┐   ┌────────────┐   ┌────────────────┐   ┌───────────────────────────┐
+│ Incoming mail│-->│ Sieve      │-->│ Inbox/Triage   │-->│ triage.ts                 │
+│              │   │ catch-all  │   │ mailbox        │   │  1. classify (category,   │
+└──────────────┘   └────────────┘   └────────────────┘   │     notify)               │
+                                                          │  2. act: move             │
+                                                          │  3. tag: $ai-* keyword(s) │
+                                                          │  4. notify: Pushover      │
+                                                          └────────────┬──────────────┘
                                                                        │
-                                              ┌────────────────────────┼───────────────────┐
-                                              ▼                        ▼                   ▼
-                                     Inbox (attention/keep/     Inbox/News          Archive/Noise
-                                      suspicious)               (newsletters)         (noise)
-                                                                                          
-                                           Pushover push for attention (prio 1),
-                                           suspicious (prio 0), keep (prio -1).
-                                           No notification for newsletters/noise.
+                              ┌─────────────┬────────────┬────────────┼───────────────┐
+                              ▼             ▼            ▼            ▼               ▼
+                           Inbox    Inbox/Orders  Inbox/Suspicious  Inbox/News   Archive/Noise
+
+                           Pushover push (priority 0) whenever the model's own
+                           `notify` field is true, for any category — see §3.4.
 ```
 
-- **Classification (unchanged)**: fetch from `Inbox/Triage`, classify with
-  Claude Haiku on Bedrock, into `attention` | `keep` | `suspicious` |
-  `newsletters` | `noise`. See v4 doc §3.1-§3.7 — not repeated here.
-- **Action (new)**: move each classified email out of `Inbox/Triage` into
-  exactly one destination mailbox, per the mapping in §2.
-- **Notify (new)**: after a successful move, fire a Pushover push for
-  `attention`/`keep`/`suspicious` (not for `newsletters`/`noise`), with a
-  deep link back to the message in Fastmail's web UI.
-- **Tag (new)**: stamp each successfully-moved email with an
-  `$ai-<promptVersion>-<category>` keyword, so a later, separate learning
-  stage (not built here) can compare this original classification against
-  wherever the email actually ends up after the user files it manually. See
-  §3.6.
+- **Classify**: fetch from `Inbox/Triage`, classify each email individually
+  (one Bedrock call per email) with Claude Haiku, into one of five categories
+  plus an independent `notify` boolean. See §3.1, §3.6.
+- **Act**: move each classified email out of `Inbox/Triage` into exactly one
+  destination mailbox, per the mapping in §2.
+- **Tag**: stamp each successfully-moved email with an
+  `$ai-<promptVersion>-<category>` keyword (and, when notified,
+  `$ai-<promptVersion>-notified`), so a later, separate learning stage (not
+  built yet) can compare this original classification against wherever the
+  email actually ends up after the user files it manually. See §3.6.
+- **Notify**: after a successful move, fire a Pushover push for any email the
+  model marked `notify: true`, regardless of category, with a deep link back
+  to the message in Fastmail's web UI. See §3.4.
 
 ## 2. Requirements
 
@@ -72,383 +58,309 @@ That validation has now happened (v4 §9). v5 closes the loop:
 
   | Category | Destination |
   |---|---|
-  | `attention` | `Inbox` |
-  | `keep` | `Inbox` |
-  | `suspicious` | `Inbox` |
+  | `inbox` | `Inbox` |
+  | `orders` | `Inbox/Orders` |
+  | `suspicious` | `Inbox/Suspicious` |
   | `newsletters` | `Inbox/News` |
   | `noise` | `Archive/Noise` |
 
-  This mapping was specified by the user, not derived — see §5 for the
-  interpretation this doc assumes (`Inbox/Triage` is a source mailbox that
-  every classified email leaves, not a fifth destination).
-- Send a Pushover notification per moved email, gated on category:
-
-  | Category | Priority | Notify? |
-  |---|---|---|
-  | `attention` | `1` | yes |
-  | `suspicious` | `0` | yes |
-  | `keep` | `-1` | yes |
-  | `newsletters` | — | no |
-  | `noise` | — | no |
-
+  `Inbox/Triage` is the *source* mailbox every classified email leaves, not a
+  sixth destination any category maps to.
+- Send a Pushover notification (priority `0`) for every successfully-moved
+  email where the model's `notify` field is `true` — independent of category.
+  There is no category-level gate in code; restraint (e.g. never pushing for
+  `suspicious`) lives entirely in the classification prompt (§3.4, prompt.ts
+  v7 changelog).
 - The notification links back to the message in Fastmail (`url` /
-  `url_title` params, per the Pushover example in the request).
+  `url_title` params).
 - Stamp a `$ai-<promptVersion>-<category>` keyword on every successfully-moved
-  email (§3.6) — one keyword, mutually exclusive with the other four, since
-  categories are mutually exclusive.
-- Default to **not writing anything** unless explicitly told to (`--apply`)
-  — see §5. This preserves the validate-before-touching-the-account posture
-  v4 established, now applied to the action stage instead of the
-  classification stage.
-- Split `triage.ts` into functional modules — see §4.
+  email, and an additional `$ai-<promptVersion>-notified` keyword when
+  `notify` was true (§3.6).
+- Default to **not writing anything** unless explicitly told to (`--apply`).
+- Runnable both from a terminal (CLI) and unattended (AWS Lambda on an
+  EventBridge schedule) from the same pipeline logic — see §3.7.
 
 ## 3. Architecture
 
-### 3.1 Data flow (additions to v4's pipeline)
+### 3.1 Data flow
 
 ```
-main()
-  ├─ [v4, unchanged] load config, bootstrap JMAP session
-  ├─ resolveMailboxes(session)                  -- NEW
-  │     resolves { triage, inbox, inboxNews, archivedNoise } mailbox ids
-  │     (env var overrides skip each lookup individually, same pattern as
-  │      today's TRIAGE_MAILBOX_ID)
-  ├─ [v4, unchanged] fetchTriageEmails(...)
-  │     -- now also requests the JMAP `preview` property (needed for
-  │        notification message bodies, §3.4) alongside the properties v4
-  │        already fetches
-  ├─ [v4, unchanged] classifyBatch(...) per email
-  ├─ planActions(classified)                     -- NEW, pure function
-  │     category -> destination mailbox id, per §2's table
+main() [triage.ts / CLI shell in main.ts]
+  ├─ load config: .env, CLI flags (--limit, --apply, --no-notify)
+  ├─ bootstrapSession(token)                     -- jmap-session.ts
+  ├─ resolveMailboxes(session, overrides)         -- mailboxes.ts
+  │     resolves all six mailbox ids in MAILBOX_SPECS (§3.2)
+  ├─ fetchTriageEmails(session, triageId, limit)  -- fetch-emails.ts
+  ├─ classifyBatch(...) per email                 -- classify.ts, one Bedrock
+  │     call per email (CLASSIFY_BATCH_SIZE = 1)
+  ├─ planActions(emails, outcomes, destinations)  -- actions.ts, pure function
+  │     category -> destination mailbox + $ai-* keyword(s), per §2's table
   ├─ if --apply:
-  │     applyMoves(session, mailboxes.triage, planned)   -- NEW
-  │       one Email/set call per write-batch (§3.3), patch-style
-  │       mailboxIds + $ai-<version>-<category> keyword update in the same
-  │       patch object (§3.6); failures collected, not thrown
-  │     for each successfully-moved, notification-eligible email:
-  │       sendPushoverNotification(email, category, destinationMailboxId) -- NEW
+  │     applyMoves(session, triageId, planned)    -- actions.ts
+  │       one Email/set call per write-batch (§3.3), patch-style mailboxIds +
+  │       keyword update in the same patch object; failures collected, not
+  │       thrown
+  │     for each successfully-moved email with notify: true:
+  │       sendPushoverNotification(...)           -- notify.ts
   │         non-fatal on failure; logged, run continues
   │   else:
   │     print planned moves / notifications, perform neither ("dry run")
-  └─ [v4, unchanged shape] print classification table + failures table
-     + NEW: print moves table (moved / skipped / failed) + notifications
-       table (sent / skipped / failed)
+  └─ print classification table + failures, moves table (moved / skipped /
+     failed), notifications table (sent / skipped / failed)
 ```
 
-### 3.2 Mailbox resolution (`resolveMailboxes`)
+### 3.2 Mailbox resolution (`mailboxes.ts`)
 
-Generalizes v4's `getTriageMailboxId` (which resolved one mailbox by a
-top-level `Mailbox/query` name filter) to resolve a **path** of mailboxes,
-since three of the four mailboxes in play are nested:
+Every mailbox the pipeline touches is described once, in a single table,
+`MAILBOX_SPECS`:
 
+```ts
+{ key, path, envVar, category? }
 ```
-resolveMailboxPath(session, ["Inbox", "News"]) -> mailbox id
-```
 
-- The first path segment is resolved by JMAP `role` when the name matches a
-  known role (`"Inbox"` → `role: "inbox"`), falling back to a top-level
-  (`parentId: null`) name match otherwise. Resolving `Inbox` by role rather
-  than by name string is deliberate — role is the part of RFC 8621 actually
-  guaranteed unique and stable; a display-name match on "Inbox" is
-  incidental and would break under a renamed or localized mailbox.
-- Subsequent segments are resolved by name among the children of the
-  previously-resolved id (`Mailbox/query { filter: { parentId, name } }`).
-- Each of the four mailboxes gets its own optional env var override
-  (`INBOX_MAILBOX_ID`, `INBOX_NEWS_MAILBOX_ID`, `ARCHIVE_NOISE_MAILBOX_ID`,
-  and the existing `TRIAGE_MAILBOX_ID`), following the precedent already
-  set for `Inbox/Triage` — all four are stable ids across runs, so a future
-  Lambda deployment can skip every lookup by setting all four.
-- `Inbox/Triage` is confirmed to be `TRIAGE_MAILBOX_ID`'s new path (§5.2) —
-  today's single-segment `Mailbox/query { filter: { name: "Triage" } }`
-  lookup is replaced by `resolveMailboxPath(["Inbox", "Triage"])`, but the
-  env var itself keeps its existing name (`TRIAGE_MAILBOX_ID`) since it's
-  still the same mailbox, just resolved via a path instead of a bare name
-  filter.
-- **No mailbox is auto-created.** If `Inbox/News` or `Archive/Noise`
-  doesn't exist, resolution fails fast with an actionable message ("create
-  mailbox <name> under <parent> in Fastmail Settings → Mailboxes, or set
-  <ENV_VAR> if it already exists under a different name/parent") —
-  mirroring the existing `BEDROCK_MODEL_ID`/`getTriageMailboxId` fail-fast
-  style. Auto-creating mailbox structure is a bigger, separate decision than
-  moving mail between mailboxes that already exist; see §6 non-goals. This
-  applies to the whole run, not just the affected category — a run that
-  can't resolve any of the four mailboxes fails before fetching or
-  classifying anything, rather than classifying and then silently skipping
-  moves for one category (§5.5).
+`config.ts`'s override reading and `actions.ts`'s category→destination
+mapping both derive from this table rather than keeping their own hand-synced
+copy — adding a mailbox means adding one row here, not editing three files in
+lockstep.
 
-### 3.3 Moving mail (`applyMoves`)
+- `resolveMailboxPath(session, path)` resolves a path of mailbox names, since
+  five of the six mailboxes in play are nested under `Inbox` or `Archive`.
+  The first path segment is resolved by JMAP `role` when the name matches a
+  known role (`Inbox` → `role: "inbox"`, `Archive` → `role: "archive"`),
+  falling back to a top-level (`parentId: null`) name match otherwise — role
+  is the part of RFC 8621 actually guaranteed unique and stable; a
+  display-name match is incidental and would break under a renamed or
+  localized mailbox. Subsequent segments are resolved by name among the
+  children of the previously-resolved id. A shared root (e.g. `Inbox`) is
+  resolved once and cached across every spec that starts with it.
+- Each of the six mailboxes has its own optional env var override
+  (`TRIAGE_MAILBOX_ID`, `INBOX_MAILBOX_ID`, `INBOX_ORDERS_MAILBOX_ID`,
+  `INBOX_SUSPICIOUS_MAILBOX_ID`, `INBOX_NEWS_MAILBOX_ID`,
+  `ARCHIVE_NOISE_MAILBOX_ID`) that skips its lookup and uses the given id
+  directly — all six are stable ids across runs, which is what lets the
+  Lambda deployment (§3.7) skip every `Mailbox/query` call.
+- **No mailbox is auto-created.** If a destination mailbox doesn't exist,
+  resolution fails fast with an actionable message ("create mailbox <name>
+  under <parent> in Fastmail Settings → Mailboxes, or set <ENV_VAR> if it
+  already exists under a different name/parent"). This applies to the whole
+  run: resolution happens before fetching or classifying anything, so a
+  missing mailbox is caught before a single Bedrock call is spent, rather
+  than classifying and then silently skipping moves for one category.
 
-- A move is a JMAP `Email/set` **patch update** on `mailboxIds`, not a
-  full-object replace: `{"mailboxIds/<triageId>": null, "mailboxIds/<destId>": true}`.
-  Patch form is used (not `mailboxIds: {destId: true}` wholesale) because
-  JMAP mailboxIds is a set an email can belong to more than one member of
-  simultaneously — patching only the two entries in play leaves any other
-  mailbox membership (e.g. a shared "starred"-equivalent mailbox, if one
-  exists) untouched, which a wholesale replace would silently clobber.
-- **Batched, unlike classification.** v4's `BATCH_SIZE = 1` is a Bedrock
-  constraint (one model call per email, for accuracy reasons unrelated to
-  writes — see v4 §5). There's no equivalent constraint on `Email/set`;
-  multiple emails' updates are batched into a single `Email/set` call up to
-  a `WRITE_BATCH_SIZE` (default 50, chosen conservatively below typical
-  JMAP server `maxObjectsInSet` limits — confirm against
-  `session.capabilities["urn:ietf:params:jmap:core"].maxObjectsInSet` at
-  implementation time rather than assuming 50 is safe for every server).
+### 3.3 Moving mail (`actions.ts` — `applyMoves`)
+
+- A move is a JMAP `Email/set` **patch update** on `mailboxIds`, not a full
+  replace: `{"mailboxIds/<triageId>": null, "mailboxIds/<destId>": true}`.
+  Patch form is used because JMAP `mailboxIds` is a set an email can belong
+  to more than one member of simultaneously — patching only the two entries
+  in play leaves any other mailbox membership untouched, which a wholesale
+  replace would silently clobber.
+- **Batched, unlike classification.** Classification is one Bedrock call per
+  email (a model-accuracy choice, unrelated to writes). There's no equivalent
+  constraint on `Email/set`: multiple emails' updates are batched into a
+  single call, up to `WRITE_BATCH_SIZE` (50, chosen conservatively below
+  typical JMAP server `maxObjectsInSet` limits).
 - **Per-email failure isolation.** `Email/set`'s response separates
   `updated` from `notUpdated` per id within one call, so a single email
   rejected by the server (e.g. concurrently deleted by the user) doesn't
-  fail its whole batch — unlike v4's classification batching, where a
-  malformed model response fails everything in the batch because there's no
-  per-item structure to fall back on.
+  fail the rest of its batch.
 - **Crash/re-run safety by construction, no processed-marker needed.** A
   move is the only state change that removes an email from `Inbox/Triage`.
-  If the script crashes after moving some emails but before finishing
-  notifications, or before finishing the whole batch, a re-run simply
-  re-fetches whatever is still in `Inbox/Triage` — already-moved emails
-  aren't there anymore, so they aren't reprocessed. This is why moves happen
-  before notifications in the per-email sequence (§3.1): the moved-ness of
-  an email, not a separate log file, is the durable state.
+  If the script crashes mid-run, a re-run simply re-fetches whatever is
+  still in `Inbox/Triage` — already-moved emails aren't there anymore, so
+  they aren't reprocessed.
+- The `$ai-*` keyword(s) (§3.6) ride in the same `Email/set` patch object as
+  the mailbox change — one write per email, not two — so a move and its
+  keyword(s) always succeed or fail together.
 
-### 3.4 Notifications (`sendPushoverNotification`)
+### 3.4 Notifications (`notify.ts` — `sendPushoverNotification`)
 
-Request shape follows the example in the request verbatim
-(`application/x-www-form-urlencoded` POST to
-`https://api.pushover.net/1/messages.json`):
+`application/x-www-form-urlencoded` POST to
+`https://api.pushover.net/1/messages.json`:
 
 | Param | Value |
 |---|---|
-| `token` | `PUSHOVER_TOKEN` (env) |
-| `user` | `PUSHOVER_USER` (env) |
+| `token` | `PUSHOVER_TOKEN` (env / SSM) |
+| `user` | `PUSHOVER_USER` (env / SSM) |
 | `title` | `subject` |
-| `message` | `"<from>\n<preview>"` — `preview` is JMAP's own ~250-char preview field (§3.1), not the full `body` text v4 fetches for classification |
-| `priority` | `1` / `0` / `-1` per §2's table |
+| `message` | `"<from>\n<preview>"` — JMAP's own ~250-char `preview` field, not the full body text used for classification |
+| `priority` | `0` (normal) |
 | `url` | Fastmail deep link, see below |
 | `url_title` | `"Open in Fastmail"` |
 
-**Deep link URL: `EMAIL_ID`-keyed, not the thread-composite from the
-example.** The example URL
-(`https://app.fastmail.com/mail/Inbox/AxL4aAHkUMeR.StnXASWtFBJR`) decomposes
-as `/mail/<mailbox-name>/<threadId>.<emailId>`. Per direction, v5 instead
-uses `/mail/<mailbox-path>/<emailId>` — just the email id v4 already has
-(`TriageEmail.id`), no `threadId` lookup needed. This drops the extra
-`Email/get` property mentioned in an earlier draft of this doc (§3.1).
-
-- `<mailbox-path>` is the *destination* mailbox's **full path**
-  (post-move), confirmed live against a nested mailbox:
-  `https://app.fastmail.com/mail/Inbox/Triage/StnVqnj87Erc` — a mailbox
-  nested two levels deep uses its full `Inbox/Triage` path, not a leaf
-  name. So the notification URL is `Inbox` for attention/keep/suspicious,
-  `Inbox/News` for newsletters, `Archive/Noise` for noise — the same path
-  strings used to resolve each destination's mailbox id in §3.2, reused
-  as-is for the URL rather than re-derived from the resolved mailbox's bare
-  name.
-- **Notify only after a confirmed move.** If `Email/set` reports an email
-  as `notUpdated`, no notification is sent for it — the deep link would
-  point at a mailbox the email was never actually filed into.
+- **Single notify tier, driven entirely by the model's own `notify` field**
+  (classify.ts / prompt.ts), not by category. There is deliberately no
+  category gate in code — what keeps e.g. `suspicious` mail from pushing is
+  the prompt's NOTIFY section, not this code. See prompt.ts's v7 changelog
+  for the reasoning (a push on a phishing email increases the odds of
+  careless engagement, so `suspicious` never sets `notify: true` by prompt
+  convention, not by a code-level filter).
+- **Deep link URL**: `https://app.fastmail.com/mail/<destination-path>/<emailId>`
+  — the *destination* mailbox's full path (post-move) plus the bare email
+  id, verified live against a nested mailbox
+  (`https://app.fastmail.com/mail/Inbox/Triage/StnVqnj87Erc` uses the full
+  `Inbox/Triage` path, not a leaf name). No `threadId` lookup is needed.
+- **Notify only after a confirmed move.** If `Email/set` reports an email as
+  `notUpdated`, no notification is sent for it — the deep link would point
+  at a mailbox the email was never actually filed into.
+- Non-fatal on failure: a Pushover error is logged and the run continues —
+  notification delivery isn't critical enough to abort a run that already
+  committed real mailbox moves.
 
 ### 3.5 Dry run vs. `--apply`
 
-v4 was unconditionally read-only. v5 introduces the account's first writes,
-so it keeps the same validate-before-touching posture v4 used for
-classification, applied one level up:
-
 - **Default (no flag): dry run.** Fetch, classify, and print exactly what
-  *would* move where and what notification *would* fire — no `Email/set`,
-  no Pushover call.
-- **`--apply`: perform the moves and send notifications.**
-- **`--no-notify`** (only meaningful with `--apply`): perform moves, skip
-  Pushover — useful for validating the move logic against a live mailbox
-  without generating phone notifications while doing so.
+  *would* move where, what keyword(s) *would* be written, and what
+  notification *would* fire — no `Email/set`, no Pushover call.
+- **`--apply`: perform the moves, write the keyword(s), and send
+  notifications.**
+- **`--no-notify`** (only meaningful with `--apply`): perform moves and
+  tagging, skip Pushover — useful for validating move logic against a live
+  mailbox without generating phone notifications while doing so.
 
-This is a deliberate escalation of v4's own reasoning (v4 §1: "Splitting
-classification from action lets classification quality be validated against
-real mail before anything touches the account's folder structure or sends a
-notification") rather than a new principle.
+### 3.6 Keyword tagging (`$ai-<promptVersion>-<category>` / `-notified`)
 
-### 3.6 Learning-stage keyword tagging (`$ai-<promptVersion>-<category>`)
+Each successfully-moved email is stamped with keywords recording what the AI
+decided and which prompt version decided it — e.g. `$ai-v7-inbox`, plus
+`$ai-v7-notified` if `notify` was true. This doesn't build a learning stage;
+it only writes the durable state a later, separate pass would need to build
+one.
 
-Each successfully-moved email is stamped with one JMAP keyword recording
-what the AI decided and which prompt decided it — e.g. `$ai-v4-attention`,
-`$ai-v4-noise`. This doesn't build a learning stage; it only writes the one
-piece of durable state a later, separate pass would need to build one.
-
-- **Format**: `$ai-<promptVersion>-<category>`. `<promptVersion>` comes from
-  a new `PROMPT_VERSION` export in `prompt.ts` (currently `"v4"` — the
-  prompt text itself is unchanged in v5, see the top-of-file note). Stamping
-  the prompt version, not just the category, means a future comparison can
-  ask "did disagreement go up after this specific prompt edit?" instead of
-  only "was this one classification wrong?".
-- **Naming convention**: `$`-prefixed custom keywords already have
-  precedent in this project — the archived `escalate.ts` PoC used
-  `$ai-escalated-dup` for an unrelated purpose. v5 follows the same
-  convention rather than inventing a new one.
+- **Format**: `$ai-<promptVersion>-<category>`, where `<promptVersion>` is
+  `prompt.ts`'s `PROMPT_VERSION` export (currently `"v7"`). Stamping the
+  prompt version, not just the category, lets a future comparison ask "did
+  disagreement go up after this specific prompt edit?" instead of only "was
+  this one classification wrong?". `$ai-<promptVersion>-notified` is a
+  separate keyword, present only when `notify` was true, so the notify
+  decision leaves a trace in the mailbox instead of existing only in a
+  Pushover log.
 - **Written where**: the same `Email/set` patch object `applyMoves` (§3.3)
-  already builds for the mailbox move — one more `keywords/$ai-...: true`
-  key alongside the two `mailboxIds/...` keys, zero extra JMAP round trips.
-  A move and its keyword are therefore atomic with each other: if the
-  `Email/set` patch for one email is rejected (`notUpdated`), neither the
-  move nor the keyword happened, and the email stays in `Inbox/Triage`
-  untagged for the next run.
-- **Written only under `--apply`**, same as the move itself — a dry run
-  still writes nothing. The dry-run table (§3.5) gets a `keyword` column
-  showing what *would* be written, alongside the existing `wouldNotify`
-  column.
+  builds for the mailbox move — `keywords/$ai-...` keys alongside the
+  `mailboxIds/...` keys, zero extra JMAP round trips. A move and its
+  keyword(s) are therefore atomic with each other: if the `Email/set` patch
+  for one email is rejected (`notUpdated`), nothing happened, and the email
+  stays in `Inbox/Triage` untagged for the next run.
+- **Written only under `--apply`**, same as the move itself. The dry-run
+  table shows the keyword(s) that would be written, alongside a
+  `wouldNotify` column.
 - **Maintenance burden, not automated**: `PROMPT_VERSION` must be bumped by
-  hand whenever `prompt.ts` changes substantively. Nothing enforces this —
-  it's an extension of the version-history comment convention `prompt.ts`
-  already keeps on every rewrite, not a new mechanism. If it's forgotten,
-  the practical failure mode is silent: classifications from two different
+  hand whenever `prompt.ts` changes substantively. Nothing enforces this. If
+  forgotten, the failure mode is silent: classifications from two different
   prompt versions get tagged identically, which just means a future
   comparison pass can't distinguish them — not a crash, not a wrong move.
-- **Why this is enough for a learning stage without building one now**: the
-  keyword travels with the email regardless of where the user later files
-  it. The comparison itself — scan wherever mail currently lives, read its
-  `$ai-*` keyword, compare the category it encodes against the mailbox the
-  email is actually sitting in now — is out of scope for v5 (§6, §8); this
-  section only adds the tag that comparison would read.
+- **Read back by `jmap-triage-mcp`'s `get_triage_report`** (`src/report.ts`)
+  — scans wherever mail currently lives for these keywords, compares the
+  category (and whether it was notified) against where the email is
+  actually sitting now. See `docs/jmap-triage-mcp-proposal-v4.md`. §6/§7
+  below describe the original, still-accurate motivation; the "not built
+  here" framing there predates that tool.
+
+### 3.7 Deployment: CLI and Lambda
+
+`main.ts` splits into `runPipeline(config)` (the pipeline body: classify →
+act → tag → notify) and `main()` (a thin CLI-only shell around it: `.env`
+loading, `process.argv` parsing, CLI-flavored required-env-var error
+messages). `triage.ts` at the repo root is just the CLI entrypoint that calls
+`main()`.
+
+`src/lambda.ts` is a second caller of `runPipeline()`, for unattended
+operation on an EventBridge schedule:
+
+- Secrets (`FASTMAIL_TOKEN`, `PUSHOVER_TOKEN`, `PUSHOVER_USER`) are fetched
+  from SSM Parameter Store `SecureString`s once per container and cached
+  across warm invocations, instead of living in plaintext Lambda env vars.
+- Everything else (`BEDROCK_MODEL_ID`, the six mailbox id overrides,
+  `LIMIT`) is a plain Lambda env var, reusing `readMailboxOverrides()` from
+  `config.ts` unchanged.
+- `event.dryRun` overrides the default `apply: true, notify: true`
+  production path, mirroring the CLI's dry-run default — e.g.
+  `aws lambda invoke --payload '{"dryRun": true}'` to validate a deployment
+  against real `Inbox/Triage` state without moving mail.
+- Errors are rethrown (not swallowed) so the invocation reports as failed —
+  Lambda's `Errors` metric and default async-invoke retry both depend on
+  that.
+
+Full deployment mechanics (SAM template, packaging, secrets setup, going
+live) are in `docs/DEPLOY-v1.md` — this section covers only the code-level
+seam that makes the same pipeline runnable from both entrypoints.
 
 ## 4. Module structure
 
-Current state: one file, `triage.ts` (~440 lines), plus `prompt.ts`. v5
-adds enough new responsibility (mailbox resolution, moves, Pushover) that
-one file stops being the right shape. Proposed layout:
-
 ```
-triage.ts                 -- thin CLI entrypoint (unchanged invocation:
-                              `npx tsx triage.ts [--limit=n] [--apply] [--no-notify]`)
-prompt.ts                 -- PROMPT text unchanged from v4; adds one export,
-                              PROMPT_VERSION (§3.6)
+triage.ts                 -- CLI entrypoint: `npx tsx triage.ts [--limit=n] [--apply] [--no-notify]`
+prompt.ts                 -- classification prompt text + PROMPT_VERSION export (§3.6)
 src/
-  config.ts                -- loadEnvFile, env var reads/validation, CLI flag
-                               parsing (--limit, --apply, --no-notify)
+  config.ts                -- loadEnvFile, CLI flag parsing, env var validation,
+                               readMailboxOverrides (generic over MAILBOX_SPECS)
   jmap-session.ts           -- Session type, bootstrapSession, jmapRequest
-  mailboxes.ts              -- resolveMailboxPath / resolveMailboxes (§3.2)
+  mailboxes.ts              -- MAILBOX_SPECS (single source of truth, §3.2),
+                               resolveMailboxes
   fetch-emails.ts           -- fetchTriageEmails, extractBodyText,
                                extractAttachmentNames, formatAddresses,
-                               TriageEmail type (v4 logic, relocated + adds
-                               the `preview` property for notifications)
+                               TriageEmail type
   classify.ts               -- classifyBatch, invokeBedrock,
-                               extractJsonArray, chunk, ClassificationOutcome
-                               type (v4 logic, relocated verbatim)
-  actions.ts                -- CATEGORY_TO_MAILBOX map (§2), planActions,
-                               applyMoves (§3.3), aiKeywordFor (§3.6)
-  notify.ts                 -- CATEGORY_TO_PRIORITY map (§2),
-                               buildFastmailUrl, sendPushoverNotification
-                               (§3.4)
-  main.ts                   -- orchestration (the body of today's `main()`),
-                               imported and invoked by top-level triage.ts
+                               extractJsonArray, ClassificationOutcome type
+  actions.ts                -- destinationsFor (derived from MAILBOX_SPECS),
+                               planActions, applyMoves, keyword helpers (§3.3, §3.6)
+  notify.ts                 -- buildFastmailUrl, sendPushoverNotification (§3.4)
+  main.ts                   -- runPipeline (reusable pipeline body) + main
+                               (CLI-only shell) (§3.7)
+  lambda.ts                 -- Lambda handler: SSM secrets, event.dryRun, calls
+                               runPipeline (§3.7)
 ```
 
 - **Split by pipeline stage, not by technical layer** (i.e. not
-  `types.ts`/`http.ts`/`utils.ts`) — each file is something a future prompt-
-  or policy-only change would touch alone: editing the label mapping
-  touches only `actions.ts`, editing notification priorities touches only
-  `notify.ts`, re-validating the classification prompt still only touches
-  `prompt.ts`. This continues v4 §3.6's rationale for keeping `prompt.ts`
-  separate (different edit/review rhythm per concern) instead of
-  introducing a new principle.
-- **Top-level `triage.ts` kept as the entrypoint** rather than renamed to
-  `src/main.ts` at the top level — the run command in `README.md`
-  (`npx tsx triage.ts`) and muscle memory around it don't need to change for
-  a refactor that's purely internal.
-- Shared types (`TriageEmail`, `ClassificationOutcome`, a new
-  `MailboxSet`/`PlannedAction` type) live in the module that owns their
-  producing function and are imported where consumed, rather than a
-  separate `types.ts` — with five-ish small modules there's no shared-type
-  file large enough yet to justify existing on its own.
+  `types.ts`/`http.ts`/`utils.ts`) — each file is something a prompt- or
+  policy-only change would touch alone: editing the category→mailbox mapping
+  touches only `mailboxes.ts`/`actions.ts`, editing notification behavior
+  touches only `notify.ts`, revising the classification prompt touches only
+  `prompt.ts`.
+- Shared types (`TriageEmail`, `ClassificationOutcome`, `PlannedAction`,
+  `MailboxRefs`) live in the module that owns their producing function and
+  are imported where consumed, rather than a separate `types.ts`.
 
-## 5. Open questions / assumptions this doc makes
+## 5. Non-goals
 
-All nine were explicitly resolved in conversation — no residual open items.
-
-1. **Resolved**: the category→mailbox mapping is
-   `attention`/`keep`/`suspicious` → `Inbox`, `newsletters` → `Inbox/News`,
-   `noise` → `Archive/Noise`. `Inbox/Triage` is the *source* mailbox that
-   every classified email leaves — not a fifth destination any category
-   maps to.
-2. **Resolved**: `Inbox/Triage` is `TRIAGE_MAILBOX_ID`'s new path — the same
-   physical mailbox `getTriageMailboxId` resolves today (v4's diagram drew
-   it as top-level, `/Triage`), now nested under `Inbox` and resolved via
-   `resolveMailboxPath(["Inbox", "Triage"])` (§3.2) instead of a bare-name
-   filter. The env var keeps its existing name.
-3. **Resolved**: the deep-link URL uses `<emailId>` alone
-   (`/mail/<mailbox-name>/<emailId>`), not the thread-composite
-   (`<threadId>.<emailId>`) the request's raw example showed (§3.4). No
-   `threadId` fetch needed.
-4. **Resolved**: the Pushover `message` body uses JMAP's own `preview`
-   field (§3.1, §3.4) rather than inventing new content or reusing v4's
-   full `body` extraction.
-5. **Resolved**: a missing `Inbox/News` or `Archive/Noise` mailbox fails
-   the whole run, not just moves for the affected category (§3.2).
-6. **Resolved, verified live**: the deep-link URL's mailbox segment is the
-   destination's **full path** (`Inbox`, `Inbox/News`, `Archive/Noise`),
-   not a leaf name — confirmed against
-   `https://app.fastmail.com/mail/Inbox/Triage/StnVqnj87Erc` (§3.4).
-7. **Resolved**: each classified email is tagged with a keyword
-   (`$ai-<promptVersion>-<category>`) for a future learning stage to read;
-   building that learning stage itself is out of scope for v5 (§3.6, §6,
-   §8).
-8. **Resolved**: the keyword includes the prompt version, not just the
-   category, via a new `PROMPT_VERSION` export in `prompt.ts` (§3.6).
-9. **Resolved**: the dry-run table (§3.5) shows the keyword that would be
-   written, in a new `keyword` column alongside `wouldNotify`; a failed move
-   fails its keyword too, with no separate handling needed, since both ride
-   in the same `Email/set` patch object (§3.6).
-
-## 6. Non-goals
-
-- **No mailbox auto-creation.** `Inbox/News` and `Archive/Noise` must
-  already exist; the script only resolves and writes to them (§3.2).
+- **No mailbox auto-creation.** All six mailboxes must already exist; the
+  script only resolves and writes to them (§3.2).
 - **No undo / rollback mechanism.** A move is a single `Email/set` patch;
-  reversing one means another `Email/set` call, done manually today — no
-  "undo last run" feature.
+  reversing one means another `Email/set` call, done manually today.
 - **No batching optimization for Pushover.** One HTTP call per
-  notification-eligible email, sent sequentially, no combining multiple
-  emails into one push. Simpler, and notification volume (attention +
-  suspicious + keep, only) is expected to be low enough that this doesn't
-  matter — revisit only if it doesn't hold in practice.
-- **No change to the classification stage itself** — categories, prompt
-  text, `BATCH_SIZE = 1`, Bedrock retry logic are all v4, unchanged. v5 is
-  additive downstream of classification, not a classification revision
-  (the one exception, `PROMPT_VERSION`, is a new export alongside the
-  unchanged prompt text, not a change to it — §3.6).
-- **No learning-stage comparison logic.** v5 only writes the
-  `$ai-<promptVersion>-<category>` keyword (§3.6); reading it back,
-  scanning wherever mail currently lives, and comparing against the
-  original classification is a separate, later piece of work.
-- **No Lambda deployment** — still future work, per v4 §8. v5's per-mailbox
-  env var overrides (§3.2) are designed with that eventual deployment in
-  mind (skip every `Mailbox/query` lookup, exactly as `TRIAGE_MAILBOX_ID`
-  already does), but the deployment itself remains out of scope here.
+  notification-eligible email, sent sequentially.
+- **No learning-stage comparison logic.** The pipeline only writes the
+  `$ai-<promptVersion>-<category>` / `-notified` keywords (§3.6); reading
+  them back and comparing against where mail actually ends up is separate,
+  later work (§6).
 
-## 7. Configuration additions
+## 6. Configuration
 
 | Env var | Required | Purpose |
 |---|---|---|
+| `FASTMAIL_TOKEN` | Yes | Fastmail API token, read/write Mail scope. |
+| `BEDROCK_MODEL_ID` | Yes | Bedrock Claude Haiku model id (looked up, not hardcoded — see README). |
 | `PUSHOVER_TOKEN` | Yes, unless `--no-notify` always passed | Pushover application token. |
 | `PUSHOVER_USER` | Yes, unless `--no-notify` always passed | Pushover user/group key. |
+| `TRIAGE_MAILBOX_ID` | No | Skips lookup of `Inbox/Triage` (source). |
 | `INBOX_MAILBOX_ID` | No | Skips role-based lookup of `Inbox`. |
+| `INBOX_ORDERS_MAILBOX_ID` | No | Skips path lookup of `Inbox/Orders`. |
+| `INBOX_SUSPICIOUS_MAILBOX_ID` | No | Skips path lookup of `Inbox/Suspicious`. |
 | `INBOX_NEWS_MAILBOX_ID` | No | Skips path lookup of `Inbox/News`. |
 | `ARCHIVE_NOISE_MAILBOX_ID` | No | Skips path lookup of `Archive/Noise`. |
+| `--limit` (CLI flag) | No | Max emails fetched from `Inbox/Triage`. Default 20. |
 | `--apply` (CLI flag) | No | Enables real writes + notifications. Default: dry run (§3.5). |
-| `--no-notify` (CLI flag) | No | With `--apply`, performs moves but suppresses Pushover. |
+| `--no-notify` (CLI flag) | No | With `--apply`, performs moves + tagging but suppresses Pushover. |
 
-`TRIAGE_MAILBOX_ID`, `FASTMAIL_TOKEN`, `BEDROCK_MODEL_ID`, `--limit` are
-unchanged from v4 (see v4 §7).
+Lambda-only configuration (`FASTMAIL_TOKEN_PARAM`, `PUSHOVER_TOKEN_PARAM`,
+`PUSHOVER_USER_PARAM` SSM parameter names, `LIMIT`, `event.dryRun`) is
+covered in `docs/DEPLOY-v1.md`, not repeated here.
 
-## 8. Future work
+## 7. Future work
 
-- Consider `Mailbox/set`-based auto-creation of `Inbox/News` /
-  `Archive/Noise` if manual setup proves to be a recurring friction point
-  (currently rejected, §6, as a bigger decision than this doc's scope).
-- Re-run this against real `/Inbox/Triage` volume in `--apply` mode once
-  built, the same way v4 §9 validated classification empirically before
-  trusting it — moves and notifications need their own live validation
-  pass, separate from classification's.
-- **Build the learning stage the `$ai-*` keyword (§3.6) exists to feed.** A
-  separate pass that scans wherever mail currently lives, reads each
-  email's `$ai-<promptVersion>-<category>` keyword, and compares it against
-  the email's current mailbox to surface disagreements (the user re-filed
-  something the AI classified differently). Not designed here — v5 only
-  writes the keyword; this is what would read it.
+- ~~Build the learning stage the `$ai-*` keywords (§3.6) exist to feed.~~
+  Done — `jmap-triage-mcp`'s `get_triage_report` (`src/report.ts`) is that
+  pass. See `docs/jmap-triage-mcp-proposal-v4.md`.
 - Remember to bump `PROMPT_VERSION` in `prompt.ts` on the next substantive
   prompt rewrite (§3.6) — nothing enforces this automatically.
+- Consider `Mailbox/set`-based auto-creation of the destination mailboxes if
+  manual setup proves to be a recurring friction point (currently rejected,
+  §5, as a bigger decision than this doc's scope).

@@ -1,9 +1,13 @@
-// Classification via Claude Haiku on Bedrock. Relocated from triage.ts (v4)
-// verbatim -- v5 doesn't change the classification stage itself, only what
-// happens downstream of it. See triage.ts-DESIGN-v5-2026-08-02.md §4 and
-// triage.ts-DESIGN-v4-2026-08-02.md §3 for the original rationale.
+// Classification via Bedrock (model chosen by BEDROCK_MODEL_ID -- currently
+// gpt-oss-120b, see samconfig.toml/.env). Changing BEDROCK_MODEL_ID also
+// needs a matching entry in model-pacing.ts, or classification falls back
+// to conservative pacing rather than the model's real quota. Relocated
+// from triage.ts (v4) verbatim -- v5 doesn't change the classification
+// stage itself, only what happens downstream of it. See
+// triage.ts-DESIGN-v5-2026-08-02.md §4 and triage.ts-DESIGN-v4-2026-08-02.md
+// §3 for the original rationale.
 
-import { BedrockRuntimeClient, InvokeModelCommand } from "@aws-sdk/client-bedrock-runtime";
+import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 import { PROMPT } from "../prompt.js";
 import type { TriageEmail } from "./fetch-emails.js";
 
@@ -19,7 +23,7 @@ export type ClassificationOutcome =
 // trailing prose (e.g. "**Reasoning:** ...") despite being told to reply
 // with ONLY the array. Extract the first balanced top-level [...] instead of
 // assuming the whole response is bare JSON.
-function extractJsonArray(text: string): string | null {
+export function extractJsonArray(text: string): string | null {
   const start = text.indexOf("[");
   if (start === -1) return null;
   let depth = 0;
@@ -52,16 +56,37 @@ function sleep(ms: number) {
 // Bedrock throttles fairly aggressively under sequential load (observed
 // empirically running 50 back-to-back calls). Retry with backoff on
 // throttling rather than assume it won't happen.
-async function invokeBedrock(client: BedrockRuntimeClient, modelId: string, body: string): Promise<string> {
+//
+// Goes through Bedrock's Converse API rather than InvokeModel with a
+// hand-built Anthropic Messages-on-Bedrock body (anthropic_version,
+// content[0].text) -- that schema is Anthropic-specific and doesn't work
+// against non-Anthropic models (e.g. Qwen). Converse is the documented
+// cross-provider interface, so modelId alone decides which model runs;
+// nothing else here is Anthropic-specific.
+async function invokeBedrock(
+  client: BedrockRuntimeClient,
+  modelId: string,
+  promptText: string,
+  userContent: string,
+  maxTokens: number
+): Promise<string> {
   for (let attempt = 0; ; attempt++) {
     try {
       const response = await client.send(
-        new InvokeModelCommand({ modelId, contentType: "application/json", accept: "application/json", body })
+        new ConverseCommand({
+          modelId,
+          system: [{ text: promptText }],
+          messages: [{ role: "user", content: [{ text: userContent }] }],
+          inferenceConfig: { maxTokens, temperature: 0 },
+        })
       );
-      const responseBody = JSON.parse(new TextDecoder().decode(response.body));
-      const text = responseBody?.content?.[0]?.text;
+      // Reasoning-first models (e.g. gpt-oss, MiniMax) emit a
+      // reasoningContent block ahead of the actual answer -- content[0] is
+      // not reliably the text block the way it is for direct-answer models,
+      // so scan for the first block that has one instead of indexing.
+      const text = response.output?.message?.content?.find((block) => typeof block.text === "string")?.text;
       if (typeof text !== "string") {
-        throw new Error(`No text content in Bedrock response: ${JSON.stringify(responseBody)}`);
+        throw new Error(`No text content in Bedrock response: ${JSON.stringify(response.output)}`);
       }
       return text;
     } catch (err) {
@@ -76,7 +101,13 @@ async function invokeBedrock(client: BedrockRuntimeClient, modelId: string, body
 export async function classifyBatch(
   client: BedrockRuntimeClient,
   modelId: string,
-  emails: TriageEmail[]
+  emails: TriageEmail[],
+  // Defaults to the bundled prompt so every existing caller (CLI, eval)
+  // keeps working unchanged. Callers that classify against a different
+  // prompt text -- the Lambda's S3-fetched live prompt, or an
+  // evaluate_candidate replay against a draft -- pass it explicitly instead
+  // of this module reaching for a single global constant.
+  promptText: string = PROMPT
 ): Promise<ClassificationOutcome[]> {
   const userContent = JSON.stringify(
     emails.map((e) => ({
@@ -90,21 +121,19 @@ export async function classifyBatch(
     }))
   );
 
-  // ~150 tokens/email of headroom, based on observed output size for the
-  // id/category schema.
-  const maxTokens = Math.min(4096, 150 * emails.length + 200);
-
-  const body = JSON.stringify({
-    anthropic_version: "bedrock-2023-05-31",
-    max_tokens: maxTokens,
-    temperature: 0,
-    system: PROMPT,
-    messages: [{ role: "user", content: userContent }],
-  });
+  // ~150 tokens/email covers the id/category/notify JSON itself, but
+  // reasoning-first models (gpt-oss, MiniMax) spend additional tokens on a
+  // reasoningContent block *before* emitting that JSON -- observed ~100-150
+  // reasoning tokens on a trivial test email, more expected on real
+  // classification decisions. 1000/email leaves headroom for that without
+  // costing anything extra for direct-answer models (Bedrock bills actual
+  // output tokens, not maxTokens), still capped well under the 4096 ceiling
+  // at CLASSIFY_BATCH_SIZE=1.
+  const maxTokens = Math.min(4096, 1000 * emails.length + 200);
 
   let responseText: string;
   try {
-    responseText = await invokeBedrock(client, modelId, body);
+    responseText = await invokeBedrock(client, modelId, promptText, userContent, maxTokens);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return emails.map((e) => ({ id: e.id, error: message }));

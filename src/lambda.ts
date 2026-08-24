@@ -5,10 +5,21 @@
 // across warm invocations; everything else (BEDROCK_MODEL_ID, the six
 // mailbox id overrides, LIMIT) is a plain Lambda env var. See
 // triage.ts-DEPLOY-v1-2026-08-02.md §2/§3/§8.
+//
+// The classification prompt itself is also fetched once per container and
+// cached across warm invocations, from S3's current.json -- the live
+// pointer jmap-triage-mcp's approve_prompt_diff writes -- falling back to
+// the bundled prompt.ts if that fetch fails (see loadPrompt() below). This
+// is what makes a prompt approval in the review loop actually change what
+// production classifies with; before this, PROMPT/PROMPT_VERSION were
+// imported directly from prompt.ts and nothing short of a redeploy could
+// change them. See jmap-triage-mcp-proposal-v4.md.
 
 import { SSMClient, GetParametersCommand } from "@aws-sdk/client-ssm";
 import { readMailboxOverrides, type PushoverConfig } from "./config.js";
+import { getCurrentPrompt } from "./current-prompt.js";
 import { runPipeline } from "./main.js";
+import { PROMPT, PROMPT_VERSION } from "../prompt.js";
 
 const DEFAULT_LIMIT = 20;
 
@@ -21,6 +32,37 @@ interface Secrets {
 // Cached across warm invocations of the same container -- one SSM call per
 // cold start, not per invocation.
 let secretsPromise: Promise<Secrets> | undefined;
+
+interface LivePrompt {
+  version: string;
+  text: string;
+}
+
+// Cached across warm invocations, same as secretsPromise -- but unlike
+// secrets, a failed S3 fetch is not fatal: loadPrompt() itself never
+// rejects, it resolves to the bundled prompt.ts as a fail-open fallback and
+// logs a warning. That fallback result is cached for the rest of the
+// container's life too (not retried every invocation) -- an S3/history
+// outage degrades this container to the bundled prompt until it's
+// recycled, rather than paying a failed round trip on every single
+// invocation. See jmap-triage-mcp-proposal-v4.md's S3-source-of-truth
+// migration: without this, approve_prompt_diff's writes to current.json
+// never reach production.
+let promptPromise: Promise<LivePrompt> | undefined;
+
+async function loadPrompt(): Promise<LivePrompt> {
+  try {
+    const current = await getCurrentPrompt();
+    return { version: current.version, text: current.prompt };
+  } catch (err) {
+    console.warn(
+      `Falling back to bundled prompt.ts (S3 fetch of current.json failed): ${
+        err instanceof Error ? err.message : err
+      }`
+    );
+    return { version: PROMPT_VERSION, text: PROMPT };
+  }
+}
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -74,6 +116,9 @@ export async function handler(event: LambdaEvent | undefined): Promise<void> {
       throw err;
     });
 
+    promptPromise ??= loadPrompt();
+    const prompt = await promptPromise;
+
     const apply = !(event?.dryRun ?? false);
     const pushover: PushoverConfig | null = apply
       ? { token: secrets.pushoverToken, user: secrets.pushoverUser }
@@ -91,6 +136,7 @@ export async function handler(event: LambdaEvent | undefined): Promise<void> {
       pushover,
       mailboxOverrides: readMailboxOverrides(),
       options: { limit, apply, notify: apply },
+      prompt,
     });
   } catch (err) {
     // Rethrow (not swallow) so the invocation reports as failed -- Lambda's

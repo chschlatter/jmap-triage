@@ -1,17 +1,19 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  jmap-triage: polls Inbox/Triage, classifies with Claude Haiku on Bedrock,
-  moves mail, and notifies via Pushover. See
-  triage.ts-DEPLOY-v1-2026-08-02.md for the full design.
+  jmap-triage: polls Inbox/Triage, classifies with a Bedrock model (chosen
+  by the BedrockModelId parameter -- see classify.ts), moves mail, and
+  notifies via Pushover. See triage.ts-DEPLOY-v1-2026-08-02.md for the full
+  design.
 
 Parameters:
   BedrockModelId:
     Type: String
     Description: >
-      Current Claude Haiku model id (or cross-region inference profile id)
-      for eu-central-1 -- see README.md prereq 3. Not hardcoded because
-      Bedrock model ids change over time.
+      Bedrock model id (on-demand id or cross-region inference profile id)
+      for eu-central-1 that classify.ts's Converse-based invokeBedrock calls
+      -- see README.md prereq 3. Not hardcoded because both which model is
+      chosen and Bedrock model ids in general change over time.
   TriageMailboxId:
     Type: String
     Description: Inbox/Triage mailbox id (source).
@@ -64,11 +66,47 @@ Parameters:
     Type: Number
     Default: 20
     Description: Max messages fetched from Inbox/Triage per invocation.
+  McpBearerTokenParam:
+    Type: String
+    Default: /jmap-triage/mcp-bearer-token
+    Description: >
+      Name (not value) of the SecureString SSM parameter holding the
+      static bearer token jmap-triage-mcp's Streamable HTTP transport
+      checks incoming requests against. Create it out of band, same as
+      FastmailTokenParam -- see jmap-triage-mcp-claude-code-instructions.md.
+  LambdaWebAdapterLayerArn:
+    Type: String
+    Description: >
+      ARN of the current AWS Lambda Web Adapter layer for this region/arch
+      -- McpServerFunction runs as a plain Node http server (src/mcp-server.ts)
+      fronted by this layer rather than a hand-rolled Streamable-HTTP-to-
+      Lambda-event adapter. No default: look up the current published ARN
+      for this region at deploy time (awslabs/aws-lambda-web-adapter) rather
+      than trusting a value baked into this template, which could be stale.
+      NOT YET DEPLOYED/VALIDATED against real AWS -- see
+      jmap-triage-mcp-claude-code-instructions.md.
 
 Conditions:
   ScheduleIsEnabled: !Equals [!Ref ScheduleEnabled, "true"]
 
 Resources:
+  # current.json / history/* -- the S3-backed source of truth for the
+  # classification prompt (jmap-triage-mcp-proposal-v4.md). TriageFunction
+  # only reads current.json (cold-start fetch, fail-open to the bundled
+  # prompt.ts); McpServerFunction reads and writes everything under here.
+  # Versioning is on as a cheap undo path for a bad approve_prompt_diff
+  # write -- that tool has no undo of its own (see approve.ts).
+  PromptStoreBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
   TriageFunction:
     Type: AWS::Serverless::Function
     Metadata:
@@ -104,20 +142,35 @@ Resources:
           FASTMAIL_TOKEN_PARAM: !Ref FastmailTokenParam
           PUSHOVER_TOKEN_PARAM: !Ref PushoverTokenParam
           PUSHOVER_USER_PARAM: !Ref PushoverUserParam
+          PROMPT_BUCKET: !Ref PromptStoreBucket
       Policies:
         - Statement:
-            - Sid: InvokeBedrockHaiku
+            - Sid: ReadLivePrompt
               Effect: Allow
+              Action: s3:GetObject
+              # Cold-start fetch only touches current.json (getCurrentPrompt(),
+              # see lambda.ts/current-prompt.ts) -- no history/* access needed
+              # here, and no write access: this function only ever reads the
+              # live pointer, never approves a version.
+              Resource: !Sub "${PromptStoreBucket.Arn}/current.json"
+            - Sid: InvokeBedrockClassifier
+              Effect: Allow
+              # classify.ts calls Bedrock's Converse API (model-agnostic,
+              # not Anthropic-specific); Converse authorizes on the same
+              # bedrock:InvokeModel action as InvokeModel itself.
               Action: bedrock:InvokeModel
-              # BedrockModelId is a cross-region inference profile (e.g.
-              # eu.anthropic.claude-haiku-4-5-...), not a directly-invokable
-              # model id -- Bedrock checks IAM permission on *both* the
+              # BedrockModelId may be either a directly-invokable on-demand
+              # model id (e.g. Qwen3 235B) or a cross-region inference
+              # profile (e.g. eu.anthropic.claude-haiku-4-5-...). For a
+              # profile, Bedrock checks IAM permission on *both* the
               # inference-profile ARN (this account/region) and the
               # underlying foundation-model ARN in whichever region the
               # profile routes to, which for an "eu."-prefixed profile can
-              # be any EU region, not just where this stack is deployed.
-              # Narrowed off "*" only insofar as region/account go --
-              # narrowing to the specific model id itself is deferred, see
+              # be any EU region, not just where this stack is deployed --
+              # so both resource lines stay regardless of which kind of id
+              # BedrockModelId currently holds. Narrowed off "*" only
+              # insofar as region/account go -- narrowing to the specific
+              # model id itself is deferred, see
               # triage.ts-DEPLOY-v1-2026-08-02.md §10.
               Resource:
                 - !Sub arn:aws:bedrock:*::foundation-model/*
@@ -161,6 +214,132 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt TriageSchedule.Arn
 
+  # jmap-triage-mcp: remote, publicly-reachable Streamable HTTP server (not
+  # local stdio) exposing the 5 tools in src/mcp-server.ts. Runs as a plain
+  # Node http server rather than a hand-rolled Streamable-HTTP-to-Lambda-
+  # event adapter -- the AWS Lambda Web Adapter layer execs this process and
+  # proxies the Function URL's streamed HTTP straight to it, so mcp-server.ts
+  # has zero Lambda-specific code in it. See jmap-triage-mcp-claude-code-
+  # instructions.md ("Deployment shape").
+  #
+  # Deployed and smoke-tested 2026-08-20 (health check, MCP initialize
+  # handshake, tools/list, bearer-auth rejection, and a tool call's error
+  # path all verified over the live Function URL). LambdaWebAdapterLayerArn
+  # has no default on purpose -- look up the current layer version for this
+  # region before redeploying rather than trusting a value baked into this
+  # template, which could go stale.
+  McpServerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      # NOT esbuild -- SAM's built-in Node esbuild builder's output is the
+      # bundle alone, with nothing else copied into the package. The Lambda
+      # Web Adapter's zip-package convention needs a run.sh startup script
+      # sitting alongside that bundle (Handler: run.sh, below), so this
+      # calls `make build-McpServerFunction` instead -- see the root
+      # Makefile, which esbuild-bundles src/mcp-server.ts itself and then
+      # copies src/mcp-server-run.sh in as run.sh. Verified against
+      # awslabs/aws-lambda-web-adapter's fastmcp-zip example, which uses the
+      # same Handler: run.sh / exec pattern for a zip (non-container)
+      # deployment.
+      BuildMethod: makefile
+    Properties:
+      # The adapter execs this directly (AWS_LAMBDA_EXEC_WRAPPER below
+      # replaces Lambda's normal handler dispatch), and run.sh's own job is
+      # to exec `node mcp-server.js` as the long-lived process the adapter
+      # then proxies HTTP traffic to.
+      Handler: run.sh
+      Runtime: nodejs24.x
+      # evaluate_candidate's replay (evaluate.ts) classifies open
+      # corrections plus a counterweight sample via Bedrock, sequentially
+      # and paced (DELAY_BETWEEN_CALLS_MS, evaluate.ts) -- a concurrent
+      # worker pool was tried and measured live to buy zero net speedup
+      # against this account's Bedrock rate limit while causing occasional
+      # outright call failures, see evaluate.ts's own comments for the
+      # matched-pair timing data. Confirmed live: at the original
+      # 20/category counterweight cap, one real replay took 371s -- inside
+      # this Lambda's old 60s timeout's replacement headroom, but Claude
+      # Desktop enforces a hard, non-configurable 4-minute (240s) timeout
+      # on remote MCP tool calls, so anything that slow just looks like a
+      # hung tool call to whoever's using it. evaluate.ts's own comments
+      # cover the actual latency fix (lower counterweight cap for an
+      # unscoped sweep, category scoping); this Timeout is a generous
+      # server-side ceiling on top of that, not the binding constraint
+      # (Lambda's own max is 900s; RESPONSE_STREAM invoke mode supports the
+      # full range, unlike the 30s buffered-mode cap).
+      Timeout: 600
+      MemorySize: 512
+      Layers:
+        - !Ref LambdaWebAdapterLayerArn
+      Environment:
+        Variables:
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/bootstrap
+          # Lowercase, adapter-specific value -- NOT the same casing as the
+          # Function URL's own InvokeMode property below (RESPONSE_STREAM).
+          # Verified against awslabs/aws-lambda-web-adapter's README (env
+          # var table) rather than assumed.
+          AWS_LWA_INVOKE_MODE: response_stream
+          PORT: "8080"
+          PROMPT_BUCKET: !Ref PromptStoreBucket
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          FASTMAIL_TOKEN_PARAM: !Ref FastmailTokenParam
+          # MCP_BEARER_TOKEN_PARAM deliberately NOT set (2026-08-20): Claude.ai's
+          # custom-connector UI doesn't offer a static-bearer-token field on
+          # this account, and OAuth wasn't built yet -- see mcp-server.ts's
+          # isAuthorized()/bearerConfigured(). The SSM parameter and this
+          # function's read permission on it (below) are left in place so
+          # re-enabling later is a one-line env var addition + redeploy, not
+          # a new IAM change. McpBearerTokenParam stays a template parameter
+          # for that reason even though it's unused here right now.
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: RESPONSE_STREAM
+      Policies:
+        - Statement:
+            - Sid: ReadWritePromptStore
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              # Unlike TriageFunction's read-only current.json grant, this
+              # is the one role allowed to write current.json and
+              # history/* -- approve_prompt_diff (approve.ts) is the only
+              # write path in the whole system, and it runs under this
+              # function.
+              Resource: !Sub "${PromptStoreBucket.Arn}/*"
+            - Sid: ListPromptStore
+              Effect: Allow
+              Action: s3:ListBucket
+              # Without this, S3 answers a GetObject on a key that doesn't
+              # exist with 403 AccessDenied instead of 404 NoSuchKey (S3
+              # won't confirm non-existence to a caller that can't list the
+              # bucket) -- confirmed live: history.ts/approve.ts both treat
+              # a missing history/index.json as "empty, not an error" by
+              # checking for NoSuchKey specifically, which silently breaks
+              # without this grant. Scoped to the bucket itself, not its
+              # objects.
+              Resource: !GetAtt PromptStoreBucket.Arn
+            - Sid: InvokeBedrockClassifier
+              Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                - !Sub arn:aws:bedrock:*::foundation-model/*
+                - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*
+            - Sid: ReadMcpSecrets
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${FastmailTokenParam}
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${McpBearerTokenParam}
+
 Outputs:
   TriageFunctionArn:
     Value: !GetAtt TriageFunction.Arn
+  PromptStoreBucketName:
+    Value: !Ref PromptStoreBucket
+  McpServerFunctionUrl:
+    Description: >
+      Streamable HTTP endpoint for the jmap-triage-mcp custom connector --
+      append /mcp (e.g. https://<id>.lambda-url.<region>.on.aws/mcp).
+    Value: !GetAtt McpServerFunctionUrl.FunctionUrl

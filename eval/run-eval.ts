@@ -12,7 +12,8 @@
 
 import { BedrockRuntimeClient } from "@aws-sdk/client-bedrock-runtime";
 import { loadEnvFile, requireBedrockModelId } from "../src/config.js";
-import { classifyBatch } from "../src/classify.js";
+import { classifyBatch, type ClassificationOutcome } from "../src/classify.js";
+import { getConcurrency, runPaced } from "../src/model-pacing.js";
 import { PROMPT_VERSION } from "../prompt.js";
 import { GOLDEN_SET } from "./golden-set.js";
 
@@ -20,14 +21,6 @@ import { GOLDEN_SET } from "./golden-set.js";
 // rather than imported, since main.ts doesn't export it (it's meant to stay
 // pipeline-internal) and this script has no other reason to import main.ts.
 const BEDROCK_REGION = "eu-central-1";
-// Mirrors classify.ts's CLASSIFY_BATCH_SIZE=1 production behavior: emails
-// are sent to the model one at a time, not batched, so this eval reflects
-// what actually gets asked of the model at runtime.
-const DELAY_BETWEEN_CALLS_MS = 300;
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 interface ReportRow {
   id: string;
@@ -41,49 +34,52 @@ interface ReportRow {
   error?: string;
 }
 
+function buildRow(c: (typeof GOLDEN_SET)[number], outcome: ClassificationOutcome): ReportRow {
+  if ("error" in outcome) {
+    return {
+      id: c.id,
+      subject: c.subject,
+      expectedCategory: c.expectedCategory,
+      actualCategory: "(error)",
+      categoryOk: false,
+      expectedNotify: c.expectedNotify,
+      error: outcome.error,
+    };
+  }
+  const categoryOk = outcome.category === c.expectedCategory;
+  const notifyOk = c.expectedNotify === undefined ? undefined : outcome.notify === c.expectedNotify;
+  return {
+    id: c.id,
+    subject: c.subject,
+    expectedCategory: c.expectedCategory,
+    actualCategory: outcome.category,
+    categoryOk,
+    expectedNotify: c.expectedNotify,
+    actualNotify: outcome.notify,
+    notifyOk,
+  };
+}
+
 async function main() {
   await loadEnvFile();
   const modelId = requireBedrockModelId();
   const bedrock = new BedrockRuntimeClient({ region: BEDROCK_REGION });
-
-  console.log(`Evaluating classify.ts against prompt.ts ${PROMPT_VERSION} (model: ${modelId})`);
+  // Mirrors classify.ts's CLASSIFY_BATCH_SIZE=1 production behavior: emails
+  // are sent to the model one at a time, not batched, so this eval reflects
+  // what actually gets asked of the model at runtime. Concurrency, pacing
+  // and the burst-cap cooldown all come from model-pacing.ts's runPaced().
+  console.log(`Evaluating classify.ts against prompt.ts ${PROMPT_VERSION} (model: ${modelId}, concurrency: ${getConcurrency(modelId)})`);
   console.log(`${GOLDEN_SET.length} case(s)\n`);
 
-  const rows: ReportRow[] = [];
-
-  for (const [i, c] of GOLDEN_SET.entries()) {
-    process.stdout.write(`[${i + 1}/${GOLDEN_SET.length}] ${c.id}... `);
+  // Progress lines below may print out of GOLDEN_SET order when
+  // concurrency > 1 -- rows[] itself stays correctly indexed regardless.
+  const rows = await runPaced(GOLDEN_SET, modelId, async (c) => {
     const [outcome] = await classifyBatch(bedrock, modelId, [c]);
-
-    if ("error" in outcome) {
-      console.log(`ERROR: ${outcome.error}`);
-      rows.push({
-        id: c.id,
-        subject: c.subject,
-        expectedCategory: c.expectedCategory,
-        actualCategory: "(error)",
-        categoryOk: false,
-        expectedNotify: c.expectedNotify,
-        error: outcome.error,
-      });
-    } else {
-      const categoryOk = outcome.category === c.expectedCategory;
-      const notifyOk = c.expectedNotify === undefined ? undefined : outcome.notify === c.expectedNotify;
-      console.log(categoryOk && notifyOk !== false ? "ok" : "MISMATCH");
-      rows.push({
-        id: c.id,
-        subject: c.subject,
-        expectedCategory: c.expectedCategory,
-        actualCategory: outcome.category,
-        categoryOk,
-        expectedNotify: c.expectedNotify,
-        actualNotify: outcome.notify,
-        notifyOk,
-      });
-    }
-
-    if (i < GOLDEN_SET.length - 1) await sleep(DELAY_BETWEEN_CALLS_MS);
-  }
+    return buildRow(c, outcome);
+  }, (row, c, i) => {
+    const status = row.error ? `ERROR: ${row.error}` : row.categoryOk && row.notifyOk !== false ? "ok" : "MISMATCH";
+    console.log(`[${i + 1}/${GOLDEN_SET.length}] ${c.id}... ${status}`);
+  });
 
   const categoryMismatches = rows.filter((r) => !r.categoryOk);
   const notifyMismatches = rows.filter((r) => r.notifyOk === false);

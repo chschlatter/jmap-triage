@@ -71,6 +71,22 @@ function extractAttachmentNames(m: any): string[] {
     .slice(0, MAX_ATTACHMENTS);
 }
 
+const EMAIL_GET_PROPERTIES = ["subject", "from", "to", "receivedAt", "textBody", "htmlBody", "attachments", "preview"];
+const EMAIL_GET_BODY_PROPERTIES = ["partId", "type", "name", "disposition"];
+
+function toTriageEmail(m: any): TriageEmail {
+  return {
+    id: m.id,
+    subject: m.subject ?? "",
+    from: formatAddresses(m.from),
+    to: formatAddresses(m.to),
+    receivedAt: m.receivedAt ?? "",
+    body: extractBodyText(m),
+    attachments: extractAttachmentNames(m),
+    preview: m.preview ?? "",
+  };
+}
+
 export async function fetchTriageEmails(session: Session, mailboxId: string, limit: number): Promise<TriageEmail[]> {
   const data = await jmapRequest(session, [CORE, MAIL], [
     [
@@ -88,8 +104,8 @@ export async function fetchTriageEmails(session: Session, mailboxId: string, lim
       {
         accountId: session.accountId,
         "#ids": { resultOf: "a", name: "Email/query", path: "/ids" },
-        properties: ["subject", "from", "to", "receivedAt", "textBody", "htmlBody", "attachments", "preview"],
-        bodyProperties: ["partId", "type", "name", "disposition"],
+        properties: EMAIL_GET_PROPERTIES,
+        bodyProperties: EMAIL_GET_BODY_PROPERTIES,
         fetchTextBodyValues: true,
         fetchHTMLBodyValues: true,
         maxBodyValueBytes: MAX_BODY_VALUE_BYTES,
@@ -103,14 +119,40 @@ export async function fetchTriageEmails(session: Session, mailboxId: string, lim
     throw new Error(`Unexpected JMAP response: ${JSON.stringify(data, null, 2)}`);
   }
 
-  return (emailGet.list as any[]).map((m) => ({
-    id: m.id,
-    subject: m.subject ?? "",
-    from: formatAddresses(m.from),
-    to: formatAddresses(m.to),
-    receivedAt: m.receivedAt ?? "",
-    body: extractBodyText(m),
-    attachments: extractAttachmentNames(m),
-    preview: m.preview ?? "",
-  }));
+  return (emailGet.list as any[]).map(toTriageEmail);
+}
+
+// Fetches specific messages by id, wherever they currently live -- unlike
+// fetchTriageEmails, not scoped to one mailbox. Used by evaluate.ts to
+// re-fetch the regression corpus's bodies at eval time (the corpus stores
+// id pointers only, not bodies, so it stays cheap to keep and can't go
+// stale the way a snapshotted body would). A deleted/inaccessible id is
+// silently absent from the result rather than failing the whole call --
+// same "isolate one bad row" posture as applyMoves' per-id notUpdated
+// handling (actions.ts).
+export async function fetchEmailsByIds(session: Session, ids: string[]): Promise<TriageEmail[]> {
+  if (ids.length === 0) return [];
+
+  const data = await jmapRequest(session, [CORE, MAIL], [
+    [
+      "Email/get",
+      {
+        accountId: session.accountId,
+        ids,
+        properties: EMAIL_GET_PROPERTIES,
+        bodyProperties: EMAIL_GET_BODY_PROPERTIES,
+        fetchTextBodyValues: true,
+        fetchHTMLBodyValues: true,
+        maxBodyValueBytes: MAX_BODY_VALUE_BYTES,
+      },
+      "a",
+    ],
+  ]);
+
+  const emailGet = data.methodResponses.find((m: any) => m[2] === "a")?.[1];
+  if (!emailGet) {
+    throw new Error(`Unexpected JMAP response: ${JSON.stringify(data, null, 2)}`);
+  }
+
+  return (emailGet.list as any[]).map(toTriageEmail);
 }

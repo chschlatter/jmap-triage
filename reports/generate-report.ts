@@ -1,5 +1,5 @@
 // One-off audit script -- not part of the deployed pipeline. Pulls every
-// email since SINCE that carries an $ai-v4-* keyword (i.e. actually went
+// email since SINCE that carries an $ai-v7-* keyword (i.e. actually went
 // through classify.ts), and reports the AI's category against where the
 // email currently sits, so a Claude+Fastmail-MCP session can spot-check
 // mismatches and rewrite prompt.ts. Read-only: no Email/set calls.
@@ -9,15 +9,18 @@
 import { loadEnvFile } from "../src/config.js";
 import { bootstrapSession, jmapRequest, CORE, MAIL } from "../src/jmap-session.js";
 
-const SINCE = "2026-07-31T00:00:00Z";
-const CATEGORIES = ["attention", "keep", "suspicious", "newsletters", "noise"] as const;
+const SINCE = "2026-08-07T00:00:00Z";
+const CATEGORIES = ["inbox", "orders", "suspicious", "newsletters", "noise"] as const;
 type Category = (typeof CATEGORIES)[number];
 
 // Mirrors destinationsFor in src/actions.ts -- the folder each category
-// should land in immediately after a triage run.
+// should land in immediately after a triage run. v7 collapsed "attention"
+// and "keep" into "inbox" and added "orders" -- see src/mailboxes.ts
+// MAILBOX_SPECS, the single source of truth this table now has to track by
+// hand since this script doesn't import it directly.
 const EXPECTED_PATH: Record<Category, string> = {
-  attention: "Inbox",
-  keep: "Inbox",
+  inbox: "Inbox",
+  orders: "Inbox/Orders",
   suspicious: "Inbox/Suspicious",
   newsletters: "Inbox/News",
   noise: "Archive/Noise",
@@ -75,7 +78,7 @@ async function main() {
     return parts.join("/") || id;
   }
 
-  const keywordFilters = CATEGORIES.map((c) => ({ hasKeyword: `$ai-v4-${c}` }));
+  const keywordFilters = CATEGORIES.map((c) => ({ hasKeyword: `$ai-v7-${c}` }));
   const queryData = await jmapRequest(session, [CORE, MAIL], [
     [
       "Email/query",
@@ -108,9 +111,12 @@ async function main() {
   const rows: ReportRow[] = [];
   for (const m of emails) {
     const keywords: Record<string, boolean> = m.keywords ?? {};
-    const categoryKey = Object.keys(keywords).find((k) => /^\$ai-v4-/.test(k));
-    if (!categoryKey) continue; // shouldn't happen given the query filter, but stay defensive
-    const category = categoryKey.replace("$ai-v4-", "") as Category;
+    // Every category keyword is also matched by /^\$ai-v7-/, but so is the
+    // separate $ai-v7-notified push marker (src/actions.ts aiNotifiedKeyword)
+    // -- an email can carry both. Match against CATEGORIES explicitly so
+    // "notified" never gets mistaken for a category.
+    const category = CATEGORIES.find((c) => keywords[`$ai-v7-${c}`]);
+    if (!category) continue; // shouldn't happen given the query filter, but stay defensive
 
     const mailboxIds: string[] = Object.keys(m.mailboxIds ?? {});
     rows.push({
@@ -131,25 +137,21 @@ async function main() {
     });
   }
 
-  // Agreement signal:
-  // - suspicious/newsletters/noise each have a folder distinct from Inbox,
-  //   so "moved somewhere other than the expected folder" is a direct
-  //   disagreement signal.
-  // - attention/keep both land in Inbox, so folder alone can't distinguish
-  //   them. Flag "left Inbox entirely" as disagreement (the user didn't
-  //   think it belonged there), and otherwise mark unknown.
-  function agreement(row: ReportRow): "match" | "mismatch" | "unknown" {
-    const inExpected = row.currentPaths.includes(row.expectedPath);
-    if (row.category === "attention" || row.category === "keep") {
-      if (!row.currentPaths.includes("Inbox")) return "mismatch";
-      return "unknown";
-    }
-    return inExpected ? "match" : "mismatch";
+  // Agreement signal: as of v7 every category has its own distinct
+  // destination folder (attention/keep collapsed into inbox -- see
+  // src/actions.ts destinationsFor), so "moved somewhere other than the
+  // expected folder" is a direct disagreement signal for all five, with one
+  // exception: Fastmail's "report phishing" button moves the email straight
+  // to Trash (confirmed by the user 2026-08-18), not Inbox/Suspicious. A
+  // `suspicious` email in Trash means the user agreed it was bad and acted
+  // on that via a different UI path -- treat it as a match, not a mismatch.
+  function agreement(row: ReportRow): "match" | "mismatch" {
+    if (row.category === "suspicious" && row.currentPaths.includes("Trash")) return "match";
+    return row.currentPaths.includes(row.expectedPath) ? "match" : "mismatch";
   }
 
   const withAgreement = rows.map((r) => ({ ...r, agreement: agreement(r) }));
   const mismatches = withAgreement.filter((r) => r.agreement === "mismatch");
-  const unknowns = withAgreement.filter((r) => r.agreement === "unknown");
   const matches = withAgreement.filter((r) => r.agreement === "match");
 
   const counts: Record<string, number> = {};
@@ -165,26 +167,27 @@ async function main() {
   );
   lines.push("");
   lines.push(
-    `Prompt version audited: \`v4\` (see \`prompt.ts\`). Categories land in: attention/keep → Inbox, ` +
-      `suspicious → Inbox/Suspicious, newsletters → Inbox/News, noise → Archive/Noise. A "mismatch" means ` +
-      `the email is no longer in its expected folder — i.e. the AI's category and the user's actual filing ` +
-      `disagree. attention/keep share one folder, so those can only be flagged as "mismatch" when the user ` +
-      `moved the email out of Inbox entirely; otherwise they're "unknown" (no signal either way from location alone — ` +
-      `check read/flagged/answered as a secondary clue).`
+    `Prompt version audited: \`v7\` (see \`prompt.ts\`). Categories land in: inbox → Inbox, ` +
+      `orders → Inbox/Orders, suspicious → Inbox/Suspicious, newsletters → Inbox/News, noise → Archive/Noise. ` +
+      `A "mismatch" means the email is no longer in its expected folder — i.e. the AI's category and the ` +
+      `user's actual filing disagree. Every category now has its own distinct destination folder, so folder ` +
+      `location alone is a direct signal for all five (no "unknown" case, unlike the v4 audit where ` +
+      `attention/keep shared one folder) — except \`suspicious\` mail the user sent to Trash via Fastmail's ` +
+      `"report phishing" button, which is counted as a match (agreement, just via a different UI path) rather ` +
+      `than a mismatch against Inbox/Suspicious.`
   );
   lines.push("");
   lines.push("## Summary");
   lines.push("");
-  lines.push("| Category | Total | Match | Mismatch | Unknown |");
-  lines.push("|---|---|---|---|---|");
+  lines.push("| Category | Total | Match | Mismatch |");
+  lines.push("|---|---|---|---|");
   for (const c of CATEGORIES) {
     const total = counts[c] ?? 0;
     const m = matches.filter((r) => r.category === c).length;
     const mm = mismatches.filter((r) => r.category === c).length;
-    const u = unknowns.filter((r) => r.category === c).length;
-    lines.push(`| ${c} | ${total} | ${m} | ${mm} | ${u} |`);
+    lines.push(`| ${c} | ${total} | ${m} | ${mm} |`);
   }
-  lines.push(`| **Total** | **${rows.length}** | **${matches.length}** | **${mismatches.length}** | **${unknowns.length}** |`);
+  lines.push(`| **Total** | **${rows.length}** | **${matches.length}** | **${mismatches.length}** |`);
   lines.push("");
 
   function rowLine(r: (typeof withAgreement)[number]): string {
@@ -215,15 +218,6 @@ async function main() {
   );
   lines.push("");
   for (const r of mismatches) lines.push(rowLine(r));
-
-  lines.push("## Unresolved — attention/keep, still in Inbox (no folder signal)");
-  lines.push("");
-  lines.push(
-    "Check `seen`/`flagged`/`answered` as a secondary clue: an *unseen, unflagged* `attention` email sitting " +
-      "untouched may have been over-flagged; a `keep` email the user replied to may have deserved `attention`."
-  );
-  lines.push("");
-  for (const r of unknowns) lines.push(rowLine(r));
 
   lines.push("## Matches — folder confirms the AI's category");
   lines.push("");

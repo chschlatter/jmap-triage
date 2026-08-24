@@ -4,7 +4,8 @@
 
 v5 of the jmap-triage system (prompt at v7). Polls `Inbox/Triage` (populated
 by a separate, already-configured Sieve catch-all rule), classifies each
-message one at a time with Claude Haiku on AWS Bedrock into one of 5
+message one at a time with a Bedrock model (BEDROCK_MODEL_ID -- currently
+gpt-oss-120b) into one of 5
 categories (`inbox`, `orders`, `suspicious`, `newsletters`, `noise`), then
 acts on the classification and notifies about it. Category decides where a
 message is filed; a separate `notify` boolean from the same model call
@@ -55,18 +56,24 @@ re-validated against real mail independently.
 2. AWS credentials with `bedrock:InvokeModel` permission for `eu-central-1`,
    available via the standard AWS SDK credential chain (environment
    variables, `~/.aws/credentials`, SSO, etc). Not read from `.env`.
-3. The current Claude Haiku model ID for `eu-central-1`, looked up rather
-   than hardcoded (Bedrock model IDs change over time):
+3. The Bedrock model ID for `eu-central-1` (currently gpt-oss-120b --
+   `openai.gpt-oss-120b-1:0`, see `BEDROCK_MODEL_ID`), looked up
+   rather than hardcoded (Bedrock model IDs and availability change over
+   time):
    ```sh
-   aws bedrock list-foundation-models --region eu-central-1 --by-provider anthropic \
-     --query "modelSummaries[?contains(modelId,'haiku')].modelId"
+   aws bedrock list-foundation-models --region eu-central-1 \
+     --query "modelSummaries[].modelId"
    ```
    If that ID isn't directly invokable in the region, also check for a
-   cross-region inference profile:
+   cross-region inference profile (needed for every current Claude model in
+   this account, not for gpt-oss):
    ```sh
    aws bedrock list-inference-profiles --region eu-central-1 \
-     --query "inferenceProfileSummaries[?contains(inferenceProfileId,'haiku')].inferenceProfileId"
+     --query "inferenceProfileSummaries[].inferenceProfileId"
    ```
+   Whichever model you pick, `src/model-pacing.ts` needs its RPM quota
+   added to stay correctly paced -- see that file's comment for how to look
+   the quota up and why it isn't just `60000 / RPM`.
 4. A Pushover token + user key (only needed to run with `--apply` and
    without `--no-notify`) — create an application at
    https://pushover.net/apps/build for the token, and find your user key on
@@ -181,3 +188,73 @@ Resolves the function's log group off the stack output rather than
 hardcoding its name, which has a random suffix that changes if the stack
 is ever recreated. Drop `--follow` for a one-shot look (add `--since 1h`
 etc.); add `--filter-pattern "ERROR"` to only see failures.
+
+### jmap-triage-mcp deployment
+
+`McpServerFunction` in `template.yaml` deploys the 5-tool review server
+(`src/mcp-server.ts` — `get_current_prompt`, `get_version_history`,
+`get_triage_report`, `evaluate_candidate`, `approve_prompt_diff`) as a
+second Lambda function behind a Function URL, so a Claude session can
+review real triage disagreements and, once a fix is approved, change what
+production classifies with — without a redeploy. Full design:
+`docs/jmap-triage-mcp-proposal-v4.md`. **Status: deployed and smoke-tested**
+against the live stack 2026-08-20, including `get_triage_report` against
+the real mailbox. Redeploying (e.g. after editing `src/mcp-server.ts`) is
+just `sam build && sam deploy`, same as the pipeline.
+
+**Auth: currently disabled by deliberate choice, not an oversight.**
+Claude.ai's custom-connector UI only reliably offers full OAuth 2.0 or no
+auth for an individual account — the static-bearer-token option
+(`static_headers`) is beta, gated to an admin on a Team/Enterprise
+workspace, and a token embedded in the connector URL is explicitly
+discouraged by Claude's own docs (logged in proxies/browser history). Given
+that, this runs with no app-level auth check for now, relying only on the
+Function URL's unguessable subdomain — acceptable for a single-user
+personal tool, but worth knowing: **anyone with the URL can call all 5
+tools, including `approve_prompt_diff`.** To re-enable the bearer-token
+check (e.g. after building real OAuth), just set `MCP_BEARER_TOKEN_PARAM`
+back in `McpServerFunction`'s `Environment.Variables` and redeploy — no
+code change needed, see `mcp-server.ts`'s `bearerConfigured()`. The
+`/jmap-triage/mcp-bearer-token` SSM secret and the function's read
+permission on it are left in place for exactly that.
+
+1. **Look up the current AWS Lambda Web Adapter layer ARN** for your region
+   and architecture (the deploy prompt below asks for it as
+   `LambdaWebAdapterLayerArn` — no default is baked into the template, since
+   a hardcoded layer version would go stale; `eu-central-1`/x86_64 was
+   `arn:aws:lambda:eu-central-1:753240598075:layer:LambdaAdapterLayerX86:28`
+   as of this deploy). See
+   [awslabs/aws-lambda-web-adapter](https://github.com/awslabs/aws-lambda-web-adapter#layer).
+2. **Deploy** (same stack as the pipeline — `sam deploy --guided` will now
+   also prompt for `McpBearerTokenParam` and `LambdaWebAdapterLayerArn`;
+   `McpServerFunction`'s build needs `make`, since it uses
+   `Metadata.BuildMethod: makefile` — see the root `Makefile` and
+   `src/mcp-server-run.sh` for why SAM's built-in Node esbuild builder
+   isn't enough here):
+   ```sh
+   sam build
+   sam deploy --guided --region eu-central-1
+   ```
+3. **Bootstrap `current.json`** — nothing seeds the S3-backed prompt
+   automatically, and `get_current_prompt` errors until it exists (the
+   *pipeline's* cold-start fetch tolerates this fine, falling back to the
+   bundled `prompt.ts`, but the review tools need a real live pointer to
+   read and diff against). Seed it from the bundled prompt once:
+   ```sh
+   npx tsx -e "import(process.cwd()+'/prompt.js').then(m => \
+     process.stdout.write(JSON.stringify({version: m.PROMPT_VERSION, prompt: m.PROMPT})))" \
+     | aws s3 cp - "s3://$(aws cloudformation describe-stacks --region eu-central-1 --stack-name jmap-triage \
+         --query "Stacks[0].Outputs[?OutputKey=='PromptStoreBucketName'].OutputValue" --output text)/current.json" \
+       --content-type application/json
+   ```
+4. **Register the custom connector** in Claude's hosted chat interface,
+   pointing it at the stack's `McpServerFunctionUrl` output plus `/mcp`
+   (e.g. `https://<id>.lambda-url.eu-central-1.on.aws/mcp`). No auth header
+   needed right now — see above.
+
+`evaluate_candidate` has no stored regression corpus to seed or maintain —
+what it replays against (open corrections + a counterweight sample) is
+derived live on every call from `get_triage_report`'s JMAP keyword scan
+plus prior approvals' recorded fixes in `history/`. See
+`docs/jmap-triage-mcp-proposal-v5.md` for why v4's persisted
+`regression-corpus.json` was removed rather than kept.

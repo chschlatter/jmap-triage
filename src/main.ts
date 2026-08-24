@@ -25,18 +25,15 @@ import { fetchTriageEmails } from "./fetch-emails.js";
 import { CLASSIFY_BATCH_SIZE, classifyBatch, type ClassificationOutcome } from "./classify.js";
 import { applyMoves, destinationsFor, planActions } from "./actions.js";
 import { sendPushoverNotification } from "./notify.js";
+import { getConcurrency, runPaced } from "./model-pacing.js";
+import { PROMPT, PROMPT_VERSION } from "../prompt.js";
 
 const BEDROCK_REGION = "eu-central-1";
-const DELAY_BETWEEN_BATCHES_MS = 300;
 
 function chunk<T>(arr: T[], size: number): T[][] {
   const out: T[][] = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
-}
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export interface PipelineConfig {
@@ -45,10 +42,16 @@ export interface PipelineConfig {
   pushover: PushoverConfig | null;
   mailboxOverrides: MailboxOverrides;
   options: CliOptions;
+  // Live prompt to classify with, e.g. fetched from S3 (see lambda.ts).
+  // Omitted by the CLI path, which classifies with the bundled prompt.ts
+  // unchanged -- CLI runs are for local validation, not production, so
+  // they don't need the S3 round trip or its fail-open fallback.
+  prompt?: { version: string; text: string };
 }
 
 export async function runPipeline(config: PipelineConfig) {
   const { token, modelId, pushover, mailboxOverrides, options } = config;
+  const prompt = config.prompt ?? { version: PROMPT_VERSION, text: PROMPT };
 
   const session = await bootstrapSession(token);
   const mailboxes = await resolveMailboxes(session, mailboxOverrides);
@@ -63,19 +66,25 @@ export async function runPipeline(config: PipelineConfig) {
   // --- Classify (v4, unchanged) ---
 
   const bedrock = new BedrockRuntimeClient({ region: BEDROCK_REGION });
+  // Concurrency and pacing both come from model-pacing.ts's runPaced() --
+  // same policy evaluate_candidate's live-mail replay uses, so a
+  // BEDROCK_MODEL_ID change stays safe in both places automatically.
+  const batches = chunk(emails, CLASSIFY_BATCH_SIZE);
+  console.log(`Classifying ${emails.length} email(s) in ${batches.length} batch(es) (concurrency: ${getConcurrency(modelId)})...`);
+  const batchResults = await runPaced(
+    batches,
+    modelId,
+    (batch) => classifyBatch(bedrock, modelId, batch, prompt.text),
+    (_result, batch, i) => console.log(`[batch ${i + 1}/${batches.length}] classified ${batch.length} email(s)`)
+  );
 
   const classificationRows: Array<{ emailId: string; subject: string; from: string; category: string; notify: boolean }> = [];
   const classificationFailures: Array<{ emailId: string; subject: string; error: string }> = [];
-  const outcomes: ClassificationOutcome[] = [];
+  const outcomes: ClassificationOutcome[] = batchResults.flat();
 
-  const batches = chunk(emails, CLASSIFY_BATCH_SIZE);
   for (const [batchIndex, batch] of batches.entries()) {
-    console.log(`[batch ${batchIndex + 1}/${batches.length}] Classifying ${batch.length} email(s)...`);
-    const batchOutcomes = await classifyBatch(bedrock, modelId, batch);
-    outcomes.push(...batchOutcomes);
-
     const emailById = new Map(batch.map((e) => [e.id, e]));
-    for (const outcome of batchOutcomes) {
+    for (const outcome of batchResults[batchIndex]) {
       const email = emailById.get(outcome.id)!;
       if ("error" in outcome) {
         classificationFailures.push({ emailId: email.id, subject: email.subject, error: outcome.error });
@@ -89,10 +98,6 @@ export async function runPipeline(config: PipelineConfig) {
         });
       }
     }
-
-    if (batchIndex < batches.length - 1) {
-      await sleep(DELAY_BETWEEN_BATCHES_MS);
-    }
   }
 
   console.log("\n--- Triage classification ---");
@@ -104,7 +109,7 @@ export async function runPipeline(config: PipelineConfig) {
 
   // --- Act: plan moves, apply only with --apply ---
 
-  const { planned, skipped } = planActions(emails, outcomes, destinations);
+  const { planned, skipped } = planActions(emails, outcomes, destinations, prompt.version);
 
   if (!options.apply) {
     console.log("\n--- Dry run: no writes performed (pass --apply to move mail and notify) ---");

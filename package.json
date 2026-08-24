@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "eval": "tsx eval/run-eval.ts"
+    "eval": "tsx eval/run-eval.ts",
+    "mcp-server": "tsx src/mcp-server.ts"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
@@ -12,8 +13,11 @@
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.1101.0",
+    "@aws-sdk/client-s3": "^3.1101.0",
     "@aws-sdk/client-ssm": "^3.1101.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "esbuild": "^0.25.12",
-    "html-to-text": "^10.0.0"
+    "html-to-text": "^10.0.0",
+    "zod": "^4.4.3"
   }
 }
