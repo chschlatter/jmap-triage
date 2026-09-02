@@ -1,7 +1,6 @@
-// Fetches classification input from Inbox/Triage. Relocated from triage.ts
-// (v4) verbatim except for one addition: the JMAP `preview` property, needed
-// for Pushover notification bodies (v5) but not used for classification
-// itself -- see triage.ts-DESIGN-v5-2026-08-02.md §3.1/§3.4.
+// Fetches classification input from Inbox/Triage. Also fetches the JMAP
+// `preview` property -- used for Pushover notification bodies, not for
+// classification itself.
 
 import { convert as htmlToText } from "html-to-text";
 import { CORE, MAIL, jmapRequest, type Session } from "./jmap-session.js";
@@ -123,13 +122,11 @@ export async function fetchTriageEmails(session: Session, mailboxId: string, lim
 }
 
 // Fetches specific messages by id, wherever they currently live -- unlike
-// fetchTriageEmails, not scoped to one mailbox. Used by evaluate.ts to
-// re-fetch the regression corpus's bodies at eval time (the corpus stores
-// id pointers only, not bodies, so it stays cheap to keep and can't go
-// stale the way a snapshotted body would). A deleted/inaccessible id is
-// silently absent from the result rather than failing the whole call --
-// same "isolate one bad row" posture as applyMoves' per-id notUpdated
-// handling (actions.ts).
+// fetchTriageEmails, not scoped to one mailbox. Used by evaluate.ts to fetch
+// bodies for its live-derived corrections and counterweight sample at eval
+// time. A deleted/inaccessible id is silently absent from the result rather
+// than failing the whole call -- same "isolate one bad row" posture as
+// applyMoves' per-id notUpdated handling (actions.ts).
 export async function fetchEmailsByIds(session: Session, ids: string[]): Promise<TriageEmail[]> {
   if (ids.length === 0) return [];
 

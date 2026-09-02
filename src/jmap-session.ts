@@ -1,6 +1,5 @@
 // JMAP session bootstrap and the generic request helper every other module
-// builds on. Split out of triage.ts unchanged (v4 -> v5 module split, see
-// triage.ts-DESIGN-v5-2026-08-02.md §4) -- no behavior change here.
+// builds on.
 
 export const SESSION_URL = "https://api.fastmail.com/jmap/session";
 export const CORE = "urn:ietf:params:jmap:core";

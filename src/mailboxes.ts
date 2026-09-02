@@ -2,12 +2,9 @@
 // mailbox is described once, in MAILBOX_SPECS below -- config.ts's
 // override reading and actions.ts's category->destination mapping both
 // derive from this same table instead of each keeping their own
-// hand-synced copy. Before this, adding the v7 "orders" category meant
-// editing three files in lockstep (a MailboxRefs field here, a
-// MailboxOverrides field + env var read in config.ts, a destinationsFor
-// entry in actions.ts) with nothing enforcing they stayed in sync --
-// forgetting one wasn't a compile error, it was a silent runtime gap.
-// Adding a category now means adding one row to this table.
+// hand-synced copy, so adding a category means adding one row here, not
+// editing multiple files in lockstep with nothing enforcing they stay in
+// sync.
 
 import { CORE, MAIL, jmapRequest, type Session } from "./jmap-session.js";
 
@@ -98,8 +95,7 @@ async function resolveChildMailbox(
 // in-flight) top-level lookup across specs that share a root -- e.g. the
 // four Inbox-rooted destination specs plus Inbox/Triage hit Mailbox/query
 // for "Inbox" itself only once between them, keyed by whichever spec's
-// envVar got there first (matches the pre-refactor getInboxId memoization,
-// just generalized to any shared root instead of hardcoding "Inbox").
+// envVar got there first.
 async function resolvePath(
   session: Session,
   path: readonly string[],
@@ -124,8 +120,7 @@ async function resolvePath(
 // Resolves every mailbox in MAILBOX_SPECS for one run. A missing mailbox
 // fails the whole run (not just moves for the affected category) --
 // resolution happens before any fetching or classifying, so a missing
-// destination is caught before spending a single Bedrock call. See
-// triage.ts-DESIGN-v5-2026-08-02.md §5 (resolved: "fail the whole run").
+// destination is caught before spending a single classify call.
 export async function resolveMailboxes(session: Session, overrides: MailboxOverrides): Promise<MailboxRefs> {
   const topLevelCache = new Map<string, Promise<string>>();
   const refs = {} as Record<MailboxKey, string>;

@@ -1,18 +1,20 @@
 // Synthetic regression fixtures for eval/run-eval.ts. Each case is a
 // hand-written email plus the category (and, where the prompt makes it
 // unambiguous, the notify value) a correct classification against the
-// CURRENT prompt.ts should produce. This is not a substitute for
-// reports/generate-report.ts, which audits real mail the user actually
-// received -- these are synthetic, so they can't catch a real-world pattern
-// nobody thought to write down here. What they're for: a fast, free,
-// repeatable check that an edit to prompt.ts didn't silently break a rule
-// the prompt already relies on (most of these cases exist because a past
-// prompt version got them wrong -- see prompt.ts's changelog for the
-// version that introduced each rule).
+// CURRENTLY LIVE prompt (S3's current.json -- see current-prompt.ts; there
+// is no bundled prompt.ts anymore) should produce. This is not a
+// substitute for reports/generate-report.ts, which audits real mail the
+// user actually received -- these are synthetic, so they can't catch a
+// real-world pattern nobody thought to write down here. What they're for:
+// a fast, free, repeatable check that a prompt change approved via
+// approve_prompt_diff didn't silently break a rule the prompt already
+// relies on (most of these cases exist because a past prompt version got
+// them wrong -- see get_version_history for the version that introduced
+// each rule).
 //
 // Add a case here whenever a real classification mismatch turns up in the
-// audit report and gets fixed in prompt.ts -- that's exactly the kind of
-// regression this file exists to catch next time.
+// audit report and gets fixed via approve_prompt_diff -- that's exactly
+// the kind of regression this file exists to catch next time.
 
 import type { TriageEmail } from "../src/fetch-emails.js";
 
@@ -21,7 +23,7 @@ export interface GoldenCase extends TriageEmail {
   // Omitted where the prompt's notify rules leave real room for judgment --
   // grading a guess against a guess would just add noise to the report.
   expectedNotify?: boolean;
-  // Which prompt.ts rule or past mismatch this case is pinned to.
+  // Which prompt rule or past mismatch this case is pinned to.
   note: string;
 }
 

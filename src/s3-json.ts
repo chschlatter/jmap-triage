@@ -6,7 +6,15 @@
 
 import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 
-const s3 = new S3Client({});
+// Explicit region, not S3Client({}) -- PromptStoreBucket lives in
+// eu-central-1 regardless of caller (same region every other AWS call in
+// this repo targets). Inside Lambda this doesn't matter (AWS_REGION is set
+// automatically), but a bare S3Client({}) falls back to the SDK's default
+// region resolution chain (~/.aws/config, AWS_REGION, etc.) for the CLI/
+// eval path, which errors with IllegalLocationConstraintException the
+// moment that resolves to anything other than eu-central-1.
+const S3_REGION = "eu-central-1";
+const s3 = new S3Client({ region: S3_REGION });
 
 export async function getJson<T>(bucket: string, key: string): Promise<T> {
   const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));

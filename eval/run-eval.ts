@@ -1,26 +1,24 @@
 // Classification eval -- NOT part of the deployed pipeline and NOT run in
 // CI. Runs the synthetic fixtures in golden-set.ts through the real
-// classifyBatch() against live Bedrock, and reports category/notify
-// mismatches against the current prompt.ts. Isolated to the classify stage
-// on purpose: no JMAP session, no mailboxes, no moves, no Pushover -- it
-// exists to catch a prompt.ts edit that silently breaks a rule the prompt
-// already relies on, quickly and without touching Fastmail. See
-// golden-set.ts for what these fixtures are (and aren't) a substitute for.
+// classifyBatch() against whichever classifier MODEL_PROVIDER selects, and
+// reports category/notify mismatches against the CURRENTLY LIVE prompt
+// (S3's current.json, fetched via getCurrentPrompt() -- there is no
+// bundled local prompt.ts to test against instead; see current-prompt.ts's
+// header comment for why). Isolated to the classify stage on purpose: no
+// JMAP session, no mailboxes, no moves, no Pushover -- it exists to catch
+// a prompt approval that silently breaks a rule the prompt already relies
+// on, quickly and without touching Fastmail. See golden-set.ts for what
+// these fixtures are (and aren't) a substitute for.
 //
 // Run: npx tsx eval/run-eval.ts
+// Requires PROMPT_BUCKET set (S3 read access) -- same as jmap-triage-mcp.
 // Exits non-zero if any category mismatch is found.
 
-import { BedrockRuntimeClient } from "@aws-sdk/client-bedrock-runtime";
-import { loadEnvFile, requireBedrockModelId } from "../src/config.js";
+import { loadEnvFile, requireModelConfig } from "../src/config.js";
 import { classifyBatch, type ClassificationOutcome } from "../src/classify.js";
 import { getConcurrency, runPaced } from "../src/model-pacing.js";
-import { PROMPT_VERSION } from "../prompt.js";
+import { getCurrentPrompt } from "../src/current-prompt.js";
 import { GOLDEN_SET } from "./golden-set.js";
-
-// Same region as main.ts's BEDROCK_REGION; kept as its own constant here
-// rather than imported, since main.ts doesn't export it (it's meant to stay
-// pipeline-internal) and this script has no other reason to import main.ts.
-const BEDROCK_REGION = "eu-central-1";
 
 interface ReportRow {
   id: string;
@@ -62,19 +60,22 @@ function buildRow(c: (typeof GOLDEN_SET)[number], outcome: ClassificationOutcome
 
 async function main() {
   await loadEnvFile();
-  const modelId = requireBedrockModelId();
-  const bedrock = new BedrockRuntimeClient({ region: BEDROCK_REGION });
+  const model = requireModelConfig();
+  const current = await getCurrentPrompt();
   // Mirrors classify.ts's CLASSIFY_BATCH_SIZE=1 production behavior: emails
   // are sent to the model one at a time, not batched, so this eval reflects
   // what actually gets asked of the model at runtime. Concurrency, pacing
   // and the burst-cap cooldown all come from model-pacing.ts's runPaced().
-  console.log(`Evaluating classify.ts against prompt.ts ${PROMPT_VERSION} (model: ${modelId}, concurrency: ${getConcurrency(modelId)})`);
+  console.log(
+    `Evaluating classify.ts against live prompt ${current.version} (provider: ${model.provider}, model: ${model.modelId}, ` +
+      `concurrency: ${getConcurrency(model.provider, model.modelId)})`
+  );
   console.log(`${GOLDEN_SET.length} case(s)\n`);
 
   // Progress lines below may print out of GOLDEN_SET order when
   // concurrency > 1 -- rows[] itself stays correctly indexed regardless.
-  const rows = await runPaced(GOLDEN_SET, modelId, async (c) => {
-    const [outcome] = await classifyBatch(bedrock, modelId, [c]);
+  const rows = await runPaced(GOLDEN_SET, model.provider, model.modelId, async (c) => {
+    const [outcome] = await classifyBatch(model, [c], current.prompt);
     return buildRow(c, outcome);
   }, (row, c, i) => {
     const status = row.error ? `ERROR: ${row.error}` : row.categoryOk && row.notifyOk !== false ? "ok" : "MISMATCH";

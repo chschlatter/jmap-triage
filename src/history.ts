@@ -3,7 +3,7 @@
 // durable but unusable: the working rule of "treat prior decisions as
 // ground truth before re-proposing something already tried" needs an actual
 // read path to be true in practice. Pure: reads history/index.json + each
-// history/<version>.json, never writes. See jmap-triage-mcp-proposal-v4.md.
+// history/<version>.json, never writes.
 
 import { requirePromptBucket } from "./config.js";
 import { getJson } from "./s3-json.js";

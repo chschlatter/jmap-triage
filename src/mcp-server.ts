@@ -1,6 +1,6 @@
-// jmap-triage-mcp adapter: registers exactly the 5 tools specified in
-// jmap-triage-mcp-proposal-v4.md as MCP tools, and serves them over
-// Streamable HTTP. Same seam as runPipeline (main.ts): current-prompt.ts,
+// jmap-triage-mcp adapter: registers the 5 prompt-governance tools (see
+// ARCHITECTURE.md) as MCP tools, and serves them over Streamable
+// HTTP. Same seam as runPipeline (main.ts): current-prompt.ts,
 // history.ts, report.ts, evaluate.ts and approve.ts are plain, deterministic
 // TypeScript with no knowledge of MCP or any other caller; this file is a
 // thin shell around them.
@@ -13,13 +13,13 @@
 // which just execs this file and proxies HTTP to whatever port it listens
 // on -- no Lambda-specific glue code needed in here.
 //
-// Auth: Fastmail/Bedrock credentials are read the same way every other
-// module in this repo reads them (config.ts, process.env) -- this server
-// runs with its own Lambda execution role and its own SSM parameters (see
-// template.yaml), same SecureString pattern lambda.ts already uses. Auth
-// for the transport itself is a single static bearer token (env var
-// MCP_BEARER_TOKEN, or MCP_BEARER_TOKEN_PARAM for an SSM-backed value) --
-// the simplest fit for a single-user server.
+// Auth: Fastmail/Bedrock/Mistral credentials are read the same way every
+// other module in this repo reads them (config.ts, process.env) -- this
+// server runs with its own Lambda execution role and its own SSM
+// parameters (see template.yaml), same SecureString pattern lambda.ts
+// already uses. Auth for the transport itself is a single static bearer
+// token (env var MCP_BEARER_TOKEN, or MCP_BEARER_TOKEN_PARAM for an
+// SSM-backed value) -- the simplest fit for a single-user server.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { GetParameterCommand, SSMClient } from "@aws-sdk/client-ssm";
@@ -169,8 +169,8 @@ export function createMcpServer(): McpServer {
 // and gated to Team/Enterprise workspaces, and a token embedded in the
 // connector URL is explicitly discouraged (Claude's own connector-auth
 // docs: URLs get logged in proxies/browser history). Given that, the
-// deliberate choice here (2026-08-20) is to run without app-level auth for
-// now, relying on the Function URL's own unguessable subdomain -- weak,
+// deliberate choice here is to run without app-level auth for now, relying
+// on the Function URL's own unguessable subdomain -- weak,
 // not a real access control, but this is a single-user personal tool, not
 // a shared service. The check below still activates automatically the
 // moment either env var is set (e.g. after building real OAuth, or if
@@ -232,6 +232,26 @@ async function ensureFastmailToken(): Promise<void> {
   await fastmailTokenPromise;
 }
 
+// Same pattern as ensureFastmailToken() above, for evaluate.ts's
+// requireModelConfig() call (used by evaluate_candidate). Only meaningful
+// when MODEL_PROVIDER=mistral -- in Bedrock mode MISTRAL_API_KEY_PARAM is
+// simply never set, so this is a silent no-op and evaluate.ts never asks
+// for the value it would have populated.
+let mistralApiKeyPromise: Promise<void> | undefined;
+
+async function ensureMistralApiKey(): Promise<void> {
+  if (process.env.MISTRAL_API_KEY) return; // already set, e.g. local dev via .env
+  mistralApiKeyPromise ??= (async () => {
+    const paramName = process.env.MISTRAL_API_KEY_PARAM;
+    if (!paramName) return; // not configured -- MODEL_PROVIDER isn't "mistral"
+    const ssm = new SSMClient({});
+    const res = await ssm.send(new GetParameterCommand({ Name: paramName, WithDecryption: true }));
+    const value = res.Parameter?.Value;
+    if (value) process.env.MISTRAL_API_KEY = value;
+  })();
+  await mistralApiKeyPromise;
+}
+
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
@@ -263,10 +283,11 @@ async function handleMcpRequest(req: IncomingMessage, res: ServerResponse): Prom
 
   try {
     await ensureFastmailToken();
+    await ensureMistralApiKey();
   } catch (err) {
     res
       .writeHead(500, { "content-type": "application/json" })
-      .end(JSON.stringify({ error: `failed to load Fastmail token: ${err instanceof Error ? err.message : err}` }));
+      .end(JSON.stringify({ error: `failed to load secrets: ${err instanceof Error ? err.message : err}` }));
     return;
   }
 

@@ -1,5 +1,4 @@
-// Pushover notification for a successfully-moved email. See
-// triage.ts-DESIGN-v5-2026-08-02.md §3.4.
+// Pushover notification for a successfully-moved email.
 
 import type { PushoverConfig } from "./config.js";
 import type { Destination } from "./actions.js";
@@ -7,19 +6,16 @@ import type { TriageEmail } from "./fetch-emails.js";
 
 const PUSHOVER_URL = "https://api.pushover.net/1/messages.json";
 
-// v7: a single notify tier, driven entirely by the model's own `notify`
-// field (see classify.ts / prompt.ts v7) -- not by category. There is
-// deliberately no category gate here: prompt.ts's NOTIFY section is what
-// keeps e.g. suspicious mail from pushing, not this code. Priority 0
-// (normal) was specified by the user, not derived.
+// A single notify tier, driven entirely by the model's own `notify` field
+// (see classify.ts) -- not by category. There is deliberately no category
+// gate here: the prompt's NOTIFY rules are what keep e.g. suspicious mail
+// from pushing, not this code.
 const PUSHOVER_PRIORITY = 0;
 
 // Deep link uses the destination mailbox's full path and the bare emailId
 // -- verified live against a real nested mailbox
 // (https://app.fastmail.com/mail/Inbox/Triage/StnVqnj87Erc uses the full
-// "Inbox/Triage" path, not a leaf name; the request's original example used
-// a threadId.emailId composite, which v5 deliberately doesn't use -- see
-// design doc §3.4/§5).
+// "Inbox/Triage" path, not a leaf name).
 function buildFastmailUrl(email: TriageEmail, destination: Destination): string {
   return `https://app.fastmail.com/mail/${destination.path}/${email.id}`;
 }

@@ -1,11 +1,9 @@
-// Shared JMAP keyword-state scan (jmap-triage-mcp-proposal-v5.md). report.ts
-// and evaluate.ts both need to know, for every email ever classified,
-// whether its stamped $ai-* category keyword matches where the email
-// currently lives -- factored out here so neither duplicates the JMAP
-// query logic. Reuses jmap-session.ts's bootstrapped session and
-// mailboxes.ts's MAILBOX_SPECS rather than a second, hand-synced copy of
-// the category->folder map (the mistake reports/generate-report.ts's own
-// comments call out -- see EXPECTED_PATH there).
+// Shared JMAP keyword-state scan. report.ts and evaluate.ts both need to
+// know, for every email ever classified, whether its stamped $ai-* category
+// keyword matches where the email currently lives -- factored out here so
+// neither duplicates the JMAP query logic. Reuses jmap-session.ts's
+// bootstrapped session and mailboxes.ts's MAILBOX_SPECS rather than a
+// second, hand-synced copy of the category->folder map.
 //
 // JMAP keyword filters are exact-match, no wildcard, and the keyword name
 // bakes in the prompt version ($ai-<version>-<category>) -- so scanning
@@ -113,8 +111,7 @@ export async function scanKeywordState(): Promise<KeywordScanResult> {
         const currentPaths = Object.keys(m.mailboxIds ?? {}).map(pathFor);
         // Fastmail's "report phishing" button moves the email straight to
         // Trash, not Inbox/Suspicious -- that's agreement via a different
-        // UI path, not a mismatch. Carried over from
-        // reports/generate-report.ts's own audit findings.
+        // UI path, not a mismatch.
         const isMatch =
           category === "suspicious" && currentPaths.includes("Trash")
             ? true

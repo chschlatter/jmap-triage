@@ -1,16 +1,13 @@
 // evaluate_candidate (jmap-triage-mcp tool #4) -- a static gate, then, only
 // if it passes, a replay against a corpus derived LIVE on every call, not a
-// stored one. Merged gate+replay into one call rather than two tools: the
-// gate always has to run before replay anyway (there's no point spending a
-// Bedrock call and a JMAP round trip on a candidate that fails a cheap
-// structural check first), so merging removes a sequencing rule from the
-// caller's head into this function's own contract. See
-// jmap-triage-mcp-proposal-v5.md, which replaced v4's persisted
-// regression-corpus.json with this live derivation -- see that doc's
-// "How this replaced the '6th tool' idea" section for the full reasoning.
+// stored one (there is no persisted regression corpus anywhere). Merged
+// gate+replay into one call rather than two tools: the gate always has to
+// run before replay anyway (there's no point spending a classify call and a
+// JMAP round trip on a candidate that fails a cheap structural check
+// first), so merging removes a sequencing rule from the caller's head into
+// this function's own contract.
 
-import { BedrockRuntimeClient } from "@aws-sdk/client-bedrock-runtime";
-import { requireBedrockModelId, requireFastmailToken } from "./config.js";
+import { requireFastmailToken, requireModelConfig } from "./config.js";
 import { getCurrentPrompt } from "./current-prompt.js";
 import { getVersionHistory } from "./history.js";
 import { classifyBatch } from "./classify.js";
@@ -20,14 +17,13 @@ import { bootstrapSession } from "./jmap-session.js";
 import { scanKeywordState, type KeywordMatch, type KeywordMismatch } from "./keyword-scan.js";
 import { MAILBOX_SPECS } from "./mailboxes.js";
 
-const BEDROCK_REGION = "eu-central-1";
 // Deterministic (sorted, not randomized) so re-evaluating the same
-// candidate mid-round compares against an identical baseline every call --
-// see jmap-triage-mcp-proposal-v5.md step 4. Sized to leave real margin
-// under Claude Desktop's hard, non-configurable 4-minute (240s) timeout on
-// remote MCP tool calls as the mailbox keeps growing -- the fixes-map
-// entries folded in on top of this cap (uncapped) are what actually
-// matter most, per the "highest-value regression guards" reasoning above.
+// candidate mid-round compares against an identical baseline every call.
+// Sized to leave real margin under Claude Desktop's hard, non-configurable
+// 4-minute (240s) timeout on remote MCP tool calls as the mailbox keeps
+// growing -- the fixes-map entries folded in on top of this cap (uncapped)
+// are what actually matter most, per the "highest-value regression guards"
+// reasoning above.
 export const COUNTERWEIGHT_PER_CATEGORY = 6;
 // Used instead of COUNTERWEIGHT_PER_CATEGORY when the caller scopes a call
 // to a single category (evaluateCandidate's `category` param) -- larger,
@@ -36,22 +32,22 @@ export const COUNTERWEIGHT_PER_CATEGORY = 6;
 // sweep's cost was always "N x 5", not "N".
 const COUNTERWEIGHT_SINGLE_CATEGORY = 20;
 // Concurrency and pacing come from model-pacing.ts's runPaced() -- keyed
-// off the model's own RPM tier, so a cross-region-profile model like
-// Haiku 4.5 (where the quota itself is the bottleneck, and concurrency
-// measured out as pure throttling risk with no throughput gain) stays
-// sequential automatically, while an on-demand model where the quota
-// measurably isn't the bottleneck gets a real worker pool.
+// off the model's own rate-limit tier, so a slow-tier model (where the
+// quota itself is the bottleneck, and concurrency measured out as pure
+// throttling risk with no throughput gain) stays sequential automatically,
+// while a fast-tier model where the quota measurably isn't the bottleneck
+// gets a real worker pool.
 
-// The exact trailing instruction every prompt version from v4 onward ends
-// with (see prompt.ts). A candidate that drops or rewords this breaks
-// classify.ts's extractJsonArray/JSON.parse contract for every email, not
-// just a misclassified one -- worth gating on before spending a single
-// Bedrock call.
+// The exact trailing instruction the live prompt ends with. A candidate
+// that drops or rewords this breaks classify.ts's
+// extractJsonArray/JSON.parse contract for every email, not just a
+// misclassified one -- worth gating on before spending a single classify
+// call.
 const JSON_REPLY_INSTRUCTION = /reply with only a json array/i;
 
 // The candidate's CATEGORY section is expected to enumerate categories the
-// same way every version of prompt.ts has: a top-level bullet whose text
-// starts with a quoted, lowercase category name followed by a colon (e.g.
+// same way the live prompt does: a top-level bullet whose text starts with
+// a quoted, lowercase category name followed by a colon (e.g.
 // `- "orders": the lifecycle of...`). This is a structural check on that
 // convention, not a prose parser -- a candidate that renames a category or
 // changes this formatting convention should fail the gate and get a human
@@ -184,9 +180,8 @@ export interface CounterweightRow {
 }
 
 // Sorted (not sampled/randomized) so the same candidate re-evaluated
-// mid-round always compares against an identical baseline, per
-// jmap-triage-mcp-proposal-v5.md step 4. Every message a past fix
-// targeted is folded in directly regardless of the per-category cap --
+// mid-round always compares against an identical baseline. Every message a
+// past fix targeted is folded in directly regardless of the per-category cap --
 // those are the highest-value regression guards, each the specific case a
 // prior fix was needed for. `capPerCategory` is the caller's choice
 // (COUNTERWEIGHT_PER_CATEGORY for an unscoped sweep,
@@ -256,17 +251,18 @@ async function replay(
   if (idsToFetch.length === 0) return { corrections: [], regressions: [] };
 
   const token = requireFastmailToken();
-  const modelId = requireBedrockModelId();
+  const model = requireModelConfig();
   const session = await bootstrapSession(token);
   const emails = await fetchEmailsByIds(session, idsToFetch);
   const emailById = new Map(emails.map((e) => [e.id, e]));
 
-  const bedrock = new BedrockRuntimeClient({ region: BEDROCK_REGION });
-
-  // classify.ts's CLASSIFY_BATCH_SIZE=1 (one email per Bedrock call) still
+  // classify.ts's CLASSIFY_BATCH_SIZE=1 (one email per classify call) still
   // holds -- a replay is only meaningful if it reflects what actually gets
-  // asked of the model at runtime.
-  const correctionResults = await runPaced(openCorrections, modelId, async (correction): Promise<CorrectionResult | null> => {
+  // asked of the model at runtime. Provider (Bedrock or Mistral) comes from
+  // `model`, same MODEL_PROVIDER config production classifies with -- this
+  // replay stays honest about what's actually live instead of silently
+  // testing against a different provider forever.
+  const correctionResults = await runPaced(openCorrections, model.provider, model.modelId, async (correction): Promise<CorrectionResult | null> => {
     const email = emailById.get(correction.messageId);
     const actualCategory = actualCategoryFromMismatch(correction);
     // No fetched body, or no resolvable ground truth to check against --
@@ -275,7 +271,7 @@ async function replay(
     // corrections list.
     if (!email || actualCategory === null) return null;
 
-    const [outcome] = await classifyBatch(bedrock, modelId, [email], candidatePrompt);
+    const [outcome] = await classifyBatch(model, [email], candidatePrompt);
     if ("error" in outcome) {
       return {
         id: correction.messageId,
@@ -298,11 +294,11 @@ async function replay(
   });
   const corrections = correctionResults.filter(isCorrectionResult);
 
-  const counterweightResults = await runPaced(counterweight, modelId, async (cw): Promise<CorrectionResult | null> => {
+  const counterweightResults = await runPaced(counterweight, model.provider, model.modelId, async (cw): Promise<CorrectionResult | null> => {
     const email = emailById.get(cw.id);
     if (!email) return null;
 
-    const [outcome] = await classifyBatch(bedrock, modelId, [email], candidatePrompt);
+    const [outcome] = await classifyBatch(model, [email], candidatePrompt);
     if ("error" in outcome) {
       // Can't verify this guard still holds -- conservatively flag it
       // rather than silently drop it.
@@ -333,16 +329,16 @@ async function replay(
 // `category` narrows the replay to just that one category's open
 // corrections and counterweight sample -- omit it for the original
 // full-sweep behavior. Scoping exists purely for latency: a diff that only
-// touches one category's wording (the common case -- see
-// jmap-triage-mcp-proposal-v5.md's "one cluster per round" default) never
-// needed the other four categories re-verified every call, and skipping
-// them is what lets COUNTERWEIGHT_SINGLE_CATEGORY stay near the original
-// per-category sample size instead of the sweep's shrunk one. The gate
-// still checks the candidate's FULL category vocabulary regardless of
-// `category` -- a candidate has to support every category either way, see
-// runGate(). Coverage for a cross-category diff (e.g. a tie-breaker
-// spanning categories) is the caller's responsibility: call once per
-// affected category, or omit `category` for a full sweep.
+// touches one category's wording (the common case, since the review loop
+// works one cluster per round by default) never needed the other four
+// categories re-verified every call, and skipping them is what lets
+// COUNTERWEIGHT_SINGLE_CATEGORY stay near the original per-category sample
+// size instead of the sweep's shrunk one. The gate still checks the
+// candidate's FULL category vocabulary regardless of `category` -- a
+// candidate has to support every category either way, see runGate().
+// Coverage for a cross-category diff (e.g. a tie-breaker spanning
+// categories) is the caller's responsibility: call once per affected
+// category, or omit `category` for a full sweep.
 export async function evaluateCandidate(
   candidate: { version: string; prompt: string },
   category?: string

@@ -3,7 +3,7 @@
 // mismatches bucket, and does its own separate lightweight notify-keyword
 // scan -- notify is an independent model decision, not part of the
 // category-agreement comparison keyword-scan.ts exists to answer, so it
-// isn't bundled into that shared scan. See jmap-triage-mcp-proposal-v5.md.
+// isn't bundled into that shared scan.
 
 import { requireFastmailToken } from "./config.js";
 import { getKnownPromptVersions, scanKeywordState } from "./keyword-scan.js";
@@ -11,9 +11,8 @@ import { bootstrapSession, jmapRequest, CORE, MAIL, type Session } from "./jmap-
 import { MAILBOX_SPECS } from "./mailboxes.js";
 
 export interface TriageReportParams {
-  // Not currently wired into the scan -- keyword-scan.ts's shared query
-  // has no date-bound support yet ("ship without one first", still true
-  // at the v5 rewrite). Kept on the tool's params for forward
+  // Not currently wired into the scan -- keyword-scan.ts's shared query has
+  // no date-bound support at all. Kept on the tool's params for forward
   // compatibility rather than breaking the schema if this lands later.
   since?: string;
 }

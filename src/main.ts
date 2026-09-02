@@ -1,19 +1,15 @@
-// Orchestrates the full v5 pipeline: classify (v4, unchanged) -> act (move)
-// -> notify. See triage.ts-DESIGN-v5-2026-08-02.md for the full picture;
-// this is the body of v4's triage.ts main(), split out per §4 and extended
-// with the two new stages. runPipeline() vs. main(): see
-// triage.ts-DEPLOY-v1-2026-08-02.md §2 -- main() is the CLI-only shell
-// (argv, .env, CLI-flavored error messages); runPipeline() is the reusable
-// body the Lambda handler (src/lambda.ts) also calls, with its own config
+// Orchestrates the full pipeline: classify -> act (move) -> notify.
+// runPipeline() is the reusable pipeline body; main() is the CLI-only shell
+// around it (argv, .env, CLI-flavored error messages) -- the Lambda handler
+// (src/lambda.ts) calls runPipeline() directly, with its own config
 // assembled from SSM/env instead.
 
-import { BedrockRuntimeClient } from "@aws-sdk/client-bedrock-runtime";
 import {
   loadEnvFile,
   parseArgs,
   readMailboxOverrides,
-  requireBedrockModelId,
   requireFastmailToken,
+  requireModelConfig,
   requirePushoverConfig,
   type CliOptions,
   type MailboxOverrides,
@@ -22,13 +18,11 @@ import {
 import { bootstrapSession } from "./jmap-session.js";
 import { resolveMailboxes } from "./mailboxes.js";
 import { fetchTriageEmails } from "./fetch-emails.js";
-import { CLASSIFY_BATCH_SIZE, classifyBatch, type ClassificationOutcome } from "./classify.js";
+import { CLASSIFY_BATCH_SIZE, classifyBatch, type ClassificationOutcome, type ClassifierConfig } from "./classify.js";
 import { applyMoves, destinationsFor, planActions } from "./actions.js";
 import { sendPushoverNotification } from "./notify.js";
 import { getConcurrency, runPaced } from "./model-pacing.js";
-import { PROMPT, PROMPT_VERSION } from "../prompt.js";
-
-const BEDROCK_REGION = "eu-central-1";
+import { getCurrentPrompt } from "./current-prompt.js";
 
 function chunk<T>(arr: T[], size: number): T[][] {
   const out: T[][] = [];
@@ -38,20 +32,20 @@ function chunk<T>(arr: T[], size: number): T[][] {
 
 export interface PipelineConfig {
   token: string;
-  modelId: string;
+  model: ClassifierConfig;
   pushover: PushoverConfig | null;
   mailboxOverrides: MailboxOverrides;
   options: CliOptions;
-  // Live prompt to classify with, e.g. fetched from S3 (see lambda.ts).
-  // Omitted by the CLI path, which classifies with the bundled prompt.ts
-  // unchanged -- CLI runs are for local validation, not production, so
-  // they don't need the S3 round trip or its fail-open fallback.
-  prompt?: { version: string; text: string };
+  // Live prompt to classify with -- always the S3-fetched current.json
+  // (see current-prompt.ts), no bundled local fallback. Required, not
+  // optional: there is no offline default (see classify.ts's
+  // classifyBatch for why), so every caller -- CLI main() below and
+  // lambda.ts alike -- fetches it before building this config.
+  prompt: { version: string; text: string };
 }
 
 export async function runPipeline(config: PipelineConfig) {
-  const { token, modelId, pushover, mailboxOverrides, options } = config;
-  const prompt = config.prompt ?? { version: PROMPT_VERSION, text: PROMPT };
+  const { token, model, pushover, mailboxOverrides, options, prompt } = config;
 
   const session = await bootstrapSession(token);
   const mailboxes = await resolveMailboxes(session, mailboxOverrides);
@@ -63,18 +57,22 @@ export async function runPipeline(config: PipelineConfig) {
     return;
   }
 
-  // --- Classify (v4, unchanged) ---
+  // --- Classify (provider chosen by `model` -- Bedrock or Mistral, see
+  // classify.ts's ClassifierConfig) ---
 
-  const bedrock = new BedrockRuntimeClient({ region: BEDROCK_REGION });
   // Concurrency and pacing both come from model-pacing.ts's runPaced() --
-  // same policy evaluate_candidate's live-mail replay uses, so a
-  // BEDROCK_MODEL_ID change stays safe in both places automatically.
+  // same policy evaluate_candidate's live-mail replay uses, so a model
+  // change stays safe in both places automatically.
   const batches = chunk(emails, CLASSIFY_BATCH_SIZE);
-  console.log(`Classifying ${emails.length} email(s) in ${batches.length} batch(es) (concurrency: ${getConcurrency(modelId)})...`);
+  console.log(
+    `Classifying ${emails.length} email(s) in ${batches.length} batch(es) via ${model.provider} ` +
+      `(concurrency: ${getConcurrency(model.provider, model.modelId)})...`
+  );
   const batchResults = await runPaced(
     batches,
-    modelId,
-    (batch) => classifyBatch(bedrock, modelId, batch, prompt.text),
+    model.provider,
+    model.modelId,
+    (batch) => classifyBatch(model, batch, prompt.text),
     (_result, batch, i) => console.log(`[batch ${i + 1}/${batches.length}] classified ${batch.length} email(s)`)
   );
 
@@ -213,14 +211,20 @@ export async function main() {
 
   const options = parseArgs(process.argv.slice(2));
   const token = requireFastmailToken();
-  const modelId = requireBedrockModelId();
+  const model = requireModelConfig();
   const pushover: PushoverConfig | null = options.notify ? requirePushoverConfig() : null;
+  // No bundled local prompt to fall back to -- see classify.ts's
+  // classifyBatch comment. CLI runs now need PROMPT_BUCKET set (same as
+  // jmap-triage-mcp already required) and S3 read access, same AWS
+  // credential chain the Bedrock path already needs.
+  const current = await getCurrentPrompt();
 
   await runPipeline({
     token,
-    modelId,
+    model,
     pushover,
     mailboxOverrides: readMailboxOverrides(),
     options,
+    prompt: { version: current.version, text: current.prompt },
   });
 }

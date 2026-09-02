@@ -1,11 +1,13 @@
 // .env loading, CLI flag parsing, and env-var validation. Kept separate from
-// the modules that consume the values (v5, see
-// triage.ts-DESIGN-v5-2026-08-02.md §4) so a new required env var or flag
+// the modules that consume the values so a new required env var or flag
 // touches one file, not the orchestration logic in main.ts.
 
+import { BedrockRuntimeClient } from "@aws-sdk/client-bedrock-runtime";
 import { MAILBOX_SPECS, type MailboxOverrides } from "./mailboxes.js";
+import type { ClassifierConfig } from "./classify.js";
 
 const DEFAULT_LIMIT = 20;
+const BEDROCK_REGION = "eu-central-1";
 
 export async function loadEnvFile(path = ".env") {
   const fs = await import("node:fs/promises");
@@ -37,8 +39,7 @@ function parseLimit(argv: string[]): number {
 
 // --apply: perform real moves + notifications. Default is dry run -- print
 // what would happen, write nothing. --no-notify (only meaningful with
-// --apply): perform moves, skip Pushover. See
-// triage.ts-DESIGN-v5-2026-08-02.md §3.5 for why the default is dry run.
+// --apply): perform moves, skip Pushover.
 export function parseArgs(argv: string[]): CliOptions {
   const apply = argv.includes("--apply");
   const notify = apply && !argv.includes("--no-notify");
@@ -77,6 +78,40 @@ export function requireBedrockModelId(): string {
   return modelId;
 }
 
+// Provider-agnostic entrypoint every non-Lambda caller (CLI main(),
+// evaluate.ts inside McpServerFunction) uses instead of reaching for
+// requireBedrockModelId() directly -- MODEL_PROVIDER picks which of the two
+// underlying providers actually classifies. Defaults to "bedrock" when
+// unset so an existing .env with only BEDROCK_MODEL_ID keeps working
+// unchanged. lambda.ts does NOT use this: TriageFunction threads its three
+// secrets through explicitly rather than mutating process.env (see its own
+// loadSecrets()), so it builds its ClassifierConfig inline instead.
+export function requireModelConfig(): ClassifierConfig {
+  const provider = process.env.MODEL_PROVIDER ?? "bedrock";
+
+  if (provider === "mistral") {
+    const apiKey = process.env.MISTRAL_API_KEY;
+    const modelId = process.env.MISTRAL_MODEL_ID;
+    if (!apiKey || !modelId) {
+      throw new Error(
+        "Error: MISTRAL_API_KEY and MISTRAL_MODEL_ID environment variables are both required\n" +
+          "when MODEL_PROVIDER=mistral.\n" +
+          "Create a key at https://console.mistral.ai/ and check which models your account's\n" +
+          "tier can actually call (some, e.g. mistral-large-latest, return a 403\n" +
+          "tier_not_allowed on lower tiers -- verify with a direct API call before setting\n" +
+          "MISTRAL_MODEL_ID, don't assume the name from Mistral's docs is available).\n" +
+          "Then set both in .env."
+      );
+    }
+    return { provider: "mistral", apiKey, modelId };
+  }
+
+  if (provider !== "bedrock") {
+    throw new Error(`Error: Unknown MODEL_PROVIDER "${provider}" -- expected "bedrock" or "mistral".`);
+  }
+  return { provider: "bedrock", client: new BedrockRuntimeClient({ region: BEDROCK_REGION }), modelId: requireBedrockModelId() };
+}
+
 export interface PushoverConfig {
   token: string;
   user: string;
@@ -97,17 +132,17 @@ export function requirePushoverConfig(): PushoverConfig {
   return { token, user };
 }
 
-// S3 bucket holding current.json / history/* (jmap-triage-mcp-proposal-v4.md).
-// Read by the Lambda pipeline's cold-start prompt fetch (lambda.ts,
-// current-prompt.ts) and by every jmap-triage-mcp tool. One bucket, one env
-// var name, shared by both deployables -- see template.yaml.
+// S3 bucket holding current.json / history/* -- see ARCHITECTURE.md.
+// Read by every classify-path caller's live prompt fetch (current-prompt.ts)
+// and by every jmap-triage-mcp tool. One bucket, one env var name, shared by
+// both deployables -- see template.yaml.
 export function requirePromptBucket(): string {
   const bucket = process.env.PROMPT_BUCKET;
   if (!bucket) {
     throw new Error(
       "Error: PROMPT_BUCKET environment variable is not set.\n" +
         "This is the S3 bucket holding current.json and history/* -- see\n" +
-        "jmap-triage-mcp-proposal-v4.md's S3 layout section."
+        "ARCHITECTURE.md's prompt section."
     );
   }
   return bucket;
@@ -116,9 +151,8 @@ export function requirePromptBucket(): string {
 export type { MailboxOverrides };
 
 // Each override skips one Mailbox/query lookup and uses the given id
-// directly -- same pattern as v4's TRIAGE_MAILBOX_ID (stable across runs,
-// intended for the future Lambda deployment to set all six and skip every
-// lookup). See triage.ts-DESIGN-v5-2026-08-02.md §3.2. Reads generically off
+// directly -- ids are stable across runs, which is what lets the Lambda
+// deployment set all six and skip every lookup. Reads generically off
 // MAILBOX_SPECS (mailboxes.ts) instead of a hand-written field per mailbox,
 // so a new mailbox spec doesn't need a matching edit here.
 export function readMailboxOverrides(): MailboxOverrides {

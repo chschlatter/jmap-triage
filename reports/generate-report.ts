@@ -1,8 +1,12 @@
-// One-off audit script -- not part of the deployed pipeline. Pulls every
-// email since SINCE that carries an $ai-v7-* keyword (i.e. actually went
-// through classify.ts), and reports the AI's category against where the
-// email currently sits, so a Claude+Fastmail-MCP session can spot-check
-// mismatches and rewrite prompt.ts. Read-only: no Email/set calls.
+// One-off audit script -- not part of the deployed pipeline, and largely
+// superseded by the jmap-triage-mcp get_triage_report tool (dynamic across
+// all prompt versions, not hardcoded to one -- see keyword-scan.ts). Pulls
+// every email since SINCE that carries an $ai-v7-* keyword (i.e. actually
+// went through classify.ts), and reports the AI's category against where
+// the email currently sits, so a Claude+Fastmail-MCP session can spot-check
+// mismatches. There is no bundled prompt.ts to rewrite anymore -- feed
+// mismatches back through evaluate_candidate/approve_prompt_diff instead.
+// Read-only: no Email/set calls.
 //
 // Run: FASTMAIL_TOKEN=... npx tsx reports/generate-report.ts
 
@@ -167,7 +171,7 @@ async function main() {
   );
   lines.push("");
   lines.push(
-    `Prompt version audited: \`v7\` (see \`prompt.ts\`). Categories land in: inbox → Inbox, ` +
+    `Prompt version audited: \`v7\` (this script's keyword filter is hardcoded to v7 -- check get_triage_report for the live version's mismatch ratios instead). Categories land in: inbox → Inbox, ` +
       `orders → Inbox/Orders, suspicious → Inbox/Suspicious, newsletters → Inbox/News, noise → Archive/Noise. ` +
       `A "mismatch" means the email is no longer in its expected folder — i.e. the AI's category and the ` +
       `user's actual filing disagree. Every category now has its own distinct destination folder, so folder ` +
@@ -213,7 +217,7 @@ async function main() {
   lines.push("");
   lines.push(
     mismatches.length
-      ? "These are the highest-value cases to feed back into `prompt.ts` — pull the full body via `read_email` before editing the prompt."
+      ? "These are the highest-value cases to feed back into a prompt revision via `evaluate_candidate`/`approve_prompt_diff` — pull the full body via `read_email` before drafting the diff."
       : "None found."
   );
   lines.push("");

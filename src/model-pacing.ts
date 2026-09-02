@@ -35,20 +35,42 @@ const KNOWN_MODEL_DELAY_MS: Record<string, number> = {
   "global.anthropic.claude-haiku-4-5-20251001-v1:0": SLOW_TIER_DELAY_MS,
 };
 
-// A model not yet catalogued above falls back to the slow tier rather than
-// the fast one: under-guessing costs wall-clock time, over-guessing costs
-// throttling retries against a quota we haven't actually confirmed.
-// invokeBedrock's retry-with-backoff (classify.ts) is still a second line
-// of defense either way, but this fallback is meant to avoid leaning on it.
-export function getPacingDelayMs(modelId: string): number {
+// Mistral (api.mistral.ai directly, not Bedrock) uses its own tier system
+// entirely separate from the Bedrock RPM numbers above -- measured
+// empirically against this account's tier during the eval that validated
+// this model (eval/run-eval-mistral.ts), not read off vendor docs.
+// Concurrency 4/300ms and even 1/1500ms both produced persistent 429s
+// against mistral-medium-latest on this account; 1/4000ms ran the full
+// 36-case golden set clean. mistral-large-latest isn't a pacing problem to
+// solve here at all -- it returned 403 tier_not_allowed outright (confirmed
+// via direct curl), meaning this account's subscription tier can't call it
+// regardless of pacing. Re-measure before trusting a different Mistral
+// model id or a different account's tier.
+const MISTRAL_MODEL_DELAY_MS: Record<string, number> = {
+  "mistral-medium-latest": 4000,
+};
+const MISTRAL_DEFAULT_DELAY_MS = 4000;
+const MISTRAL_CONCURRENCY = 1;
+
+export type ModelProvider = "bedrock" | "mistral";
+
+// A Bedrock model not yet catalogued above falls back to the slow tier
+// rather than the fast one: under-guessing costs wall-clock time,
+// over-guessing costs throttling retries against a quota we haven't
+// actually confirmed. invokeBedrock's retry-with-backoff (classify.ts) is
+// still a second line of defense either way, but this fallback is meant to
+// avoid leaning on it.
+export function getPacingDelayMs(provider: ModelProvider, modelId: string): number {
+  if (provider === "mistral") return MISTRAL_MODEL_DELAY_MS[modelId] ?? MISTRAL_DEFAULT_DELAY_MS;
   return KNOWN_MODEL_DELAY_MS[modelId] ?? SLOW_TIER_DELAY_MS;
 }
 
 // How many classifyBatch calls may run concurrently. Against a slow-tier
-// (cross-region-profile) model the RPM quota itself is the bottleneck --
-// concurrency there just means more simultaneous demand on the same
-// ceiling, which measured out as throttling retries and outright failures
-// with no throughput gain. Against a fast-tier (on-demand) model the quota
+// (cross-region-profile) Bedrock model, or against Mistral on this
+// account's tier, the RPM quota itself is the bottleneck -- concurrency
+// there just means more simultaneous demand on the same ceiling, which
+// measured out as throttling retries and outright failures with no
+// throughput gain. Against a fast-tier (on-demand) Bedrock model the quota
 // isn't the bottleneck -- real call latency is -- so a worker pool gives a
 // real speedup; burst-tested at up to 8 concurrent workers with zero
 // errors. That burst test only ran a few seconds at a time, well short of
@@ -57,7 +79,8 @@ export function getPacingDelayMs(modelId: string): number {
 const FAST_TIER_CONCURRENCY = 8;
 const SLOW_TIER_CONCURRENCY = 1;
 
-export function getConcurrency(modelId: string): number {
+export function getConcurrency(provider: ModelProvider, modelId: string): number {
+  if (provider === "mistral") return MISTRAL_CONCURRENCY;
   return KNOWN_MODEL_DELAY_MS[modelId] === FAST_TIER_DELAY_MS ? FAST_TIER_CONCURRENCY : SLOW_TIER_CONCURRENCY;
 }
 
@@ -82,12 +105,13 @@ function sleep(ms: number): Promise<void> {
 // returned array stays indexed in input order regardless.
 export async function runPaced<T, R>(
   items: T[],
+  provider: ModelProvider,
   modelId: string,
   fn: (item: T, index: number) => Promise<R>,
   onItemDone?: (result: R, item: T, index: number) => void
 ): Promise<R[]> {
-  const concurrency = getConcurrency(modelId);
-  const delayMs = getPacingDelayMs(modelId);
+  const concurrency = getConcurrency(provider, modelId);
+  const delayMs = getPacingDelayMs(provider, modelId);
   const results: R[] = new Array(items.length);
 
   let nextIndex = 0;

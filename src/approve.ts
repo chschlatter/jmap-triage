@@ -7,8 +7,7 @@
 //
 // Writes, in order: current.json (the new live pointer), then
 // history/<version>.json (the full immutable record), then
-// history/index.json (append the new version). See
-// jmap-triage-mcp-proposal-v4.md's S3 layout.
+// history/index.json (append the new version). See ARCHITECTURE.md.
 
 import { requirePromptBucket } from "./config.js";
 import { getJson, putJson } from "./s3-json.js";

@@ -1,9 +1,10 @@
 // get_current_prompt (jmap-triage-mcp tool #1) -- reads current.json, the
-// live pointer approve.ts writes. Pure: no fallback-to-bundled-prompt.ts
-// behavior here. That fallback belongs to the *production pipeline's*
-// cold-start fetch (lambda.ts), which wraps this function in a try/catch --
-// a review tool should surface a real error instead of silently returning a
-// stale local copy. See jmap-triage-mcp-claude-code-instructions.md.
+// live pointer approve.ts writes. Pure: throws on a failed fetch rather
+// than falling back to anything -- there is no local prompt to fall back
+// to (the real prompt describes a specific person, so a git-committable
+// copy would have to be either generic-and-wrong or
+// PII-bearing-and-uncommittable). Every caller (CLI, eval, Lambda,
+// jmap-triage-mcp) fetches this live.
 
 import { requirePromptBucket } from "./config.js";
 import { getJson } from "./s3-json.js";
