@@ -36,23 +36,61 @@ const KNOWN_MODEL_DELAY_MS: Record<string, number> = {
 };
 
 // Mistral (api.mistral.ai directly, not Bedrock) uses its own tier system
-// entirely separate from the Bedrock RPM numbers above -- measured
-// empirically against this account's tier during the eval that validated
-// this model (eval/run-eval-mistral.ts), not read off vendor docs.
-// Concurrency 4/300ms and even 1/1500ms both produced persistent 429s
-// against mistral-medium-latest on this account; 1/4000ms ran the full
-// 36-case golden set clean. mistral-large-latest isn't a pacing problem to
-// solve here at all -- it returned 403 tier_not_allowed outright (confirmed
-// via direct curl), meaning this account's subscription tier can't call it
-// regardless of pacing. Re-measure before trusting a different Mistral
-// model id or a different account's tier.
+// entirely separate from the Bedrock RPM numbers above. The account's
+// actual published limits for mistral-medium-latest (admin.mistral.ai/
+// plateforme/limits, tier determined by cumulative lifetime billing, not
+// prepaid credit): 1 request/second, 20,000 tokens/minute. The 4000ms
+// delay previously here was tuned only against the RPS number (it produced
+// persistent 429s below 1/1500ms, ran clean at 1/4000ms on a 36-case golden
+// set) and never checked against TPM -- at CLASSIFY_BATCH_SIZE=1 every
+// request resends the full ~950-token system prompt plus up to ~1100
+// tokens of email body (MAX_BODY_VALUE_BYTES=4000 in fetch-emails.ts), so
+// worst case is ~2200 tokens/request. 1/4000ms is 15 req/min, i.e. up to
+// ~33,000 TPM -- well over the 20,000 cap, which is what was actually
+// causing the persistent 429s against live inbox mail (RPS was never
+// close). 9000ms keeps worst-case throughput to 6.67 req/min * 2200 tok
+// ~= 14,700 TPM, ~73% of budget, leaving headroom for the window not being
+// a clean trailing-minute count. mistral-large-latest isn't a pacing
+// problem to solve here at all -- it returned 403 tier_not_allowed
+// outright (confirmed via direct curl), meaning this account's
+// subscription tier can't call it regardless of pacing. Re-measure before
+// trusting a different Mistral model id, a bigger CLASSIFY_BATCH_SIZE, or
+// a different account's tier.
 const MISTRAL_MODEL_DELAY_MS: Record<string, number> = {
-  "mistral-medium-latest": 4000,
+  "mistral-medium-latest": 9000,
 };
-const MISTRAL_DEFAULT_DELAY_MS = 4000;
+const MISTRAL_DEFAULT_DELAY_MS = 9000;
 const MISTRAL_CONCURRENCY = 1;
 
-export type ModelProvider = "bedrock" | "mistral";
+// GreenPT (api.greenpt.ai directly, not Bedrock). Measured 2026-09-20 with
+// eval/run-eval-greenpt.ts against glm-5.3-flash, not read off vendor docs --
+// GreenPT publishes no rate limits at all, and its responses carried no
+// x-ratelimit-* headers to read one off.
+//
+// The probe ran 40 requests per level at concurrency 1, 2, 4 and 8: zero
+// throttled, zero failed at every level, 537 req/min extrapolated at the top
+// level. That is a far looser ceiling than Bedrock's 100 RPM fast tier, and
+// nothing like the Mistral tier that forced the 2026-09-06 rollback.
+//
+// Why concurrency 4 and not 8: the concurrency-8 level finished its 40
+// requests in 4.5s, so "537 req/min" is extrapolation from a 4.5-second
+// burst, not a sustained minute -- exactly the caveat the Bedrock fast-tier
+// comment above already records. 4 halves the peak demand while still
+// collapsing TriageFunction's 20 calls (Limit=20) into 5 waves.
+//
+// Why a 150ms delay when no throttling was observed: p99 latency measured
+// 1.74s on one 36-call run and 6.76s on another, so the tail is not well
+// characterised by samples this small. At concurrency 4 the delay costs
+// ~0.75s across a full 20-email invocation against a 230s budget, which buys
+// margin against sustained load that was never actually tested. Re-measure
+// before raising either number.
+const GREENPT_MODEL_DELAY_MS: Record<string, number> = {
+  "glm-5.3-flash": 150,
+};
+const GREENPT_DEFAULT_DELAY_MS = 150;
+const GREENPT_CONCURRENCY = 4;
+
+export type ModelProvider = "bedrock" | "mistral" | "greenpt";
 
 // A Bedrock model not yet catalogued above falls back to the slow tier
 // rather than the fast one: under-guessing costs wall-clock time,
@@ -62,6 +100,7 @@ export type ModelProvider = "bedrock" | "mistral";
 // avoid leaning on it.
 export function getPacingDelayMs(provider: ModelProvider, modelId: string): number {
   if (provider === "mistral") return MISTRAL_MODEL_DELAY_MS[modelId] ?? MISTRAL_DEFAULT_DELAY_MS;
+  if (provider === "greenpt") return GREENPT_MODEL_DELAY_MS[modelId] ?? GREENPT_DEFAULT_DELAY_MS;
   return KNOWN_MODEL_DELAY_MS[modelId] ?? SLOW_TIER_DELAY_MS;
 }
 
@@ -81,6 +120,7 @@ const SLOW_TIER_CONCURRENCY = 1;
 
 export function getConcurrency(provider: ModelProvider, modelId: string): number {
   if (provider === "mistral") return MISTRAL_CONCURRENCY;
+  if (provider === "greenpt") return GREENPT_CONCURRENCY;
   return KNOWN_MODEL_DELAY_MS[modelId] === FAST_TIER_DELAY_MS ? FAST_TIER_CONCURRENCY : SLOW_TIER_CONCURRENCY;
 }
 

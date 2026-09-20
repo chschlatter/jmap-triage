@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  jmap-triage: polls Inbox/Triage, classifies with a Bedrock or Mistral
-  model (chosen by the ModelProvider parameter -- see classify.ts), moves
+  jmap-triage: polls Inbox/Triage, classifies with a Bedrock, Mistral or
+  GreenPT model (chosen by the ModelProvider parameter -- see classify.ts), moves
   mail, and notifies via Pushover. See ARCHITECTURE.md for the full
   design.
 
@@ -10,14 +10,14 @@ Parameters:
   ModelProvider:
     Type: String
     Default: bedrock
-    AllowedValues: ["bedrock", "mistral"]
+    AllowedValues: ["bedrock", "mistral", "greenpt"]
     Description: >
-      Which of classify.ts's two classifier backends TriageFunction and
+      Which of classify.ts's three classifier backends TriageFunction and
       McpServerFunction (the evaluate_candidate replay) use. Defaults to
       "bedrock" so a plain redeploy without new parameter_overrides can't
-      accidentally start depending on Mistral secrets that were never
-      created. Switching to "mistral" is the whole cutover -- no code
-      change, no other parameter is required to change with it.
+      accidentally start depending on provider secrets that were never
+      created. Switching is the whole cutover -- no code change, no other
+      parameter is required to change with it.
   BedrockModelId:
     Type: String
     Description: >
@@ -48,6 +48,25 @@ Parameters:
       Mistral API key (console.mistral.ai). Only fetched at runtime when
       ModelProvider=mistral -- create it out of band, same as
       FastmailTokenParam, before switching ModelProvider to "mistral".
+  GreenptModelId:
+    Type: String
+    Default: glm-5.3-flash
+    Description: >
+      Model id classify.ts's invokeOpenAICompatible calls against
+      api.greenpt.ai (not Bedrock) when ModelProvider=greenpt. Verify against
+      GET https://api.greenpt.ai/v1/models before changing -- a plan
+      restriction can hide a model the key cannot actually invoke, which is
+      how Mistral's 403 tier_not_allowed went unnoticed. glm-5.3-flash was
+      measured on the 36-case golden set at 35-36/36 category and 30-31/36
+      notify, at or above the qwen3-235b-a22b Bedrock baseline it replaced.
+  GreenptApiKeyParam:
+    Type: String
+    Default: /jmap-triage/greenpt-api-key
+    Description: >
+      Name (not value) of the SecureString SSM parameter holding the GreenPT
+      API key (greenpt.com, API-only account -- no monthly fee). Only fetched
+      at runtime when ModelProvider=greenpt -- create it out of band, same as
+      FastmailTokenParam, before switching ModelProvider to "greenpt".
   TriageMailboxId:
     Type: String
     Description: Inbox/Triage mailbox id (source).
@@ -168,6 +187,8 @@ Resources:
           BEDROCK_MODEL_ID: !Ref BedrockModelId
           MISTRAL_MODEL_ID: !Ref MistralModelId
           MISTRAL_API_KEY_PARAM: !Ref MistralApiKeyParam
+          GREENPT_MODEL_ID: !Ref GreenptModelId
+          GREENPT_API_KEY_PARAM: !Ref GreenptApiKeyParam
           TRIAGE_MAILBOX_ID: !Ref TriageMailboxId
           INBOX_MAILBOX_ID: !Ref InboxMailboxId
           INBOX_ORDERS_MAILBOX_ID: !Ref InboxOrdersMailboxId
@@ -232,6 +253,7 @@ Resources:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PushoverTokenParam}
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PushoverUserParam}
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MistralApiKeyParam}
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GreenptApiKeyParam}
 
   # Defined as raw CloudFormation, not SAM's `Events: Schedule:` shorthand
   # -- that shorthand's EventSource schema only allows Type/Properties, no
@@ -318,6 +340,8 @@ Resources:
           BEDROCK_MODEL_ID: !Ref BedrockModelId
           MISTRAL_MODEL_ID: !Ref MistralModelId
           MISTRAL_API_KEY_PARAM: !Ref MistralApiKeyParam
+          GREENPT_MODEL_ID: !Ref GreenptModelId
+          GREENPT_API_KEY_PARAM: !Ref GreenptApiKeyParam
           FASTMAIL_TOKEN_PARAM: !Ref FastmailTokenParam
           # MCP_BEARER_TOKEN_PARAM deliberately NOT set: Claude.ai's
           # custom-connector UI doesn't offer a static-bearer-token field on
@@ -376,6 +400,7 @@ Resources:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${FastmailTokenParam}
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${McpBearerTokenParam}
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MistralApiKeyParam}
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GreenptApiKeyParam}
 
 Outputs:
   TriageFunctionArn:

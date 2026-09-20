@@ -80,7 +80,7 @@ export function requireBedrockModelId(): string {
 
 // Provider-agnostic entrypoint every non-Lambda caller (CLI main(),
 // evaluate.ts inside McpServerFunction) uses instead of reaching for
-// requireBedrockModelId() directly -- MODEL_PROVIDER picks which of the two
+// requireBedrockModelId() directly -- MODEL_PROVIDER picks which of the three
 // underlying providers actually classifies. Defaults to "bedrock" when
 // unset so an existing .env with only BEDROCK_MODEL_ID keeps working
 // unchanged. lambda.ts does NOT use this: TriageFunction threads its three
@@ -106,8 +106,25 @@ export function requireModelConfig(): ClassifierConfig {
     return { provider: "mistral", apiKey, modelId };
   }
 
+  if (provider === "greenpt") {
+    const apiKey = process.env.GREENPT_API_KEY;
+    const modelId = process.env.GREENPT_MODEL_ID;
+    if (!apiKey || !modelId) {
+      throw new Error(
+        "Error: GREENPT_API_KEY and GREENPT_MODEL_ID environment variables are both required\n" +
+          "when MODEL_PROVIDER=greenpt.\n" +
+          "Create an API-only account at https://greenpt.com -- it has no monthly fee despite\n" +
+          "the pricing page's subscription wording, bills per token, and its credits do not\n" +
+          "expire. Confirm the model id against GET https://api.greenpt.ai/v1/models rather\n" +
+          "than trusting the docs: a plan restriction can hide a model your key cannot call,\n" +
+          "which is how Mistral's 403 tier_not_allowed went unnoticed. Then set both in .env."
+      );
+    }
+    return { provider: "greenpt", apiKey, modelId };
+  }
+
   if (provider !== "bedrock") {
-    throw new Error(`Error: Unknown MODEL_PROVIDER "${provider}" -- expected "bedrock" or "mistral".`);
+    throw new Error(`Error: Unknown MODEL_PROVIDER "${provider}" -- expected "bedrock", "mistral" or "greenpt".`);
   }
   return { provider: "bedrock", client: new BedrockRuntimeClient({ region: BEDROCK_REGION }), modelId: requireBedrockModelId() };
 }

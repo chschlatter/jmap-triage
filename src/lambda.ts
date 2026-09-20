@@ -1,10 +1,11 @@
 // Lambda entrypoint. Assembles the same PipelineConfig the CLI's main()
 // builds from argv/.env, but from Lambda's own config sources instead: the
-// secrets (FASTMAIL_TOKEN, PUSHOVER_TOKEN, PUSHOVER_USER, and MISTRAL_API_KEY
-// when MODEL_PROVIDER=mistral) come from SSM Parameter Store SecureStrings,
-// fetched once per container and cached across warm invocations; everything
-// else (BEDROCK_MODEL_ID, MODEL_PROVIDER, MISTRAL_MODEL_ID, the six mailbox
-// id overrides, LIMIT) is a plain Lambda env var.
+// secrets (FASTMAIL_TOKEN, PUSHOVER_TOKEN, PUSHOVER_USER, and the active
+// provider's API key when MODEL_PROVIDER is mistral or greenpt) come from SSM
+// Parameter Store SecureStrings, fetched once per container and cached across
+// warm invocations; everything else (BEDROCK_MODEL_ID, MODEL_PROVIDER,
+// MISTRAL_MODEL_ID, GREENPT_MODEL_ID, the six mailbox id overrides, LIMIT) is
+// a plain Lambda env var.
 //
 // The classification prompt itself is also fetched once per container and
 // cached across warm invocations, from S3's current.json -- the live
@@ -27,14 +28,24 @@ import { runPipeline } from "./main.js";
 const DEFAULT_LIMIT = 20;
 const BEDROCK_REGION = "eu-central-1";
 
+// Which SSM-parameter-name env var holds the API key for each non-Bedrock
+// provider. Bedrock is absent on purpose: it authenticates through the AWS
+// credential chain and has no key to fetch.
+const PROVIDER_KEY_PARAM_ENV: Record<string, string> = {
+  mistral: "MISTRAL_API_KEY_PARAM",
+  greenpt: "GREENPT_API_KEY_PARAM",
+};
+
 interface Secrets {
   fastmailToken: string;
   pushoverToken: string;
   pushoverUser: string;
-  // Only fetched (see loadSecrets()) when MODEL_PROVIDER=mistral -- a
-  // Bedrock-mode deploy has no dependency on the Mistral SSM parameter
-  // existing at all, which is what keeps the provider genuinely switchable.
-  mistralApiKey?: string;
+  // The active provider's API key -- only fetched (see loadSecrets()) when
+  // MODEL_PROVIDER names one that needs a key. A Bedrock-mode deploy has no
+  // dependency on any provider SSM parameter existing at all, which is what
+  // keeps the provider genuinely switchable. One field rather than one per
+  // provider: exactly one provider is active per deploy.
+  providerApiKey?: string;
 }
 
 // Cached across warm invocations of the same container -- one SSM call per
@@ -69,13 +80,14 @@ async function loadSecrets(): Promise<Secrets> {
   const fastmailTokenParam = requireEnv("FASTMAIL_TOKEN_PARAM");
   const pushoverTokenParam = requireEnv("PUSHOVER_TOKEN_PARAM");
   const pushoverUserParam = requireEnv("PUSHOVER_USER_PARAM");
-  // Only requested when MODEL_PROVIDER=mistral -- a Bedrock-mode deploy
-  // never touches this param name, so it doesn't need to exist in SSM at
-  // all until someone actually switches the provider.
-  const mistralApiKeyParam = process.env.MODEL_PROVIDER === "mistral" ? requireEnv("MISTRAL_API_KEY_PARAM") : undefined;
+  // Only requested for a provider that actually needs a key -- a Bedrock-mode
+  // deploy never touches these param names, so they don't need to exist in
+  // SSM at all until someone switches the provider.
+  const providerKeyParamEnv = PROVIDER_KEY_PARAM_ENV[process.env.MODEL_PROVIDER ?? "bedrock"];
+  const providerApiKeyParam = providerKeyParamEnv ? requireEnv(providerKeyParamEnv) : undefined;
 
   const names = [fastmailTokenParam, pushoverTokenParam, pushoverUserParam];
-  if (mistralApiKeyParam) names.push(mistralApiKeyParam);
+  if (providerApiKeyParam) names.push(providerApiKeyParam);
 
   const ssm = new SSMClient({});
   const response = await ssm.send(new GetParametersCommand({ Names: names, WithDecryption: true }));
@@ -91,22 +103,23 @@ async function loadSecrets(): Promise<Secrets> {
   if (!fastmailToken || !pushoverToken || !pushoverUser) {
     throw new Error("One or more SSM parameters returned an empty value");
   }
-  const mistralApiKey = mistralApiKeyParam ? byName.get(mistralApiKeyParam) : undefined;
-  if (mistralApiKeyParam && !mistralApiKey) {
-    throw new Error("MISTRAL_API_KEY_PARAM SSM parameter returned an empty value");
+  const providerApiKey = providerApiKeyParam ? byName.get(providerApiKeyParam) : undefined;
+  if (providerApiKeyParam && !providerApiKey) {
+    throw new Error(`${providerKeyParamEnv} SSM parameter returned an empty value`);
   }
 
-  return { fastmailToken, pushoverToken, pushoverUser, mistralApiKey };
+  return { fastmailToken, pushoverToken, pushoverUser, providerApiKey };
 }
 
 function loadModelConfig(secrets: Secrets): ClassifierConfig {
   const provider = process.env.MODEL_PROVIDER ?? "bedrock";
+  // apiKey is guaranteed by loadSecrets() for any provider listed in
+  // PROVIDER_KEY_PARAM_ENV -- it throws rather than returning an empty one.
   if (provider === "mistral") {
-    return {
-      provider: "mistral",
-      apiKey: secrets.mistralApiKey!, // guaranteed by loadSecrets() when provider is "mistral"
-      modelId: requireEnv("MISTRAL_MODEL_ID"),
-    };
+    return { provider: "mistral", apiKey: secrets.providerApiKey!, modelId: requireEnv("MISTRAL_MODEL_ID") };
+  }
+  if (provider === "greenpt") {
+    return { provider: "greenpt", apiKey: secrets.providerApiKey!, modelId: requireEnv("GREENPT_MODEL_ID") };
   }
   return { provider: "bedrock", client: new BedrockRuntimeClient({ region: BEDROCK_REGION }), modelId: requireEnv("BEDROCK_MODEL_ID") };
 }

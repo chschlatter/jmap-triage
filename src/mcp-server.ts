@@ -13,7 +13,7 @@
 // which just execs this file and proxies HTTP to whatever port it listens
 // on -- no Lambda-specific glue code needed in here.
 //
-// Auth: Fastmail/Bedrock/Mistral credentials are read the same way every
+// Auth: Fastmail/Bedrock/Mistral/GreenPT credentials are read the same way every
 // other module in this repo reads them (config.ts, process.env) -- this
 // server runs with its own Lambda execution role and its own SSM
 // parameters (see template.yaml), same SecureString pattern lambda.ts
@@ -234,22 +234,32 @@ async function ensureFastmailToken(): Promise<void> {
 
 // Same pattern as ensureFastmailToken() above, for evaluate.ts's
 // requireModelConfig() call (used by evaluate_candidate). Only meaningful
-// when MODEL_PROVIDER=mistral -- in Bedrock mode MISTRAL_API_KEY_PARAM is
-// simply never set, so this is a silent no-op and evaluate.ts never asks
-// for the value it would have populated.
-let mistralApiKeyPromise: Promise<void> | undefined;
+// when MODEL_PROVIDER names a provider that needs an API key -- in Bedrock
+// mode the *_API_KEY_PARAM env vars are simply never set, so this is a silent
+// no-op and evaluate.ts never asks for the value it would have populated.
+//
+// Keyed off the provider rather than one function per provider so adding a
+// fourth is a table entry, not another copy of this block.
+const PROVIDER_KEY_ENV: Record<string, { key: string; param: string }> = {
+  mistral: { key: "MISTRAL_API_KEY", param: "MISTRAL_API_KEY_PARAM" },
+  greenpt: { key: "GREENPT_API_KEY", param: "GREENPT_API_KEY_PARAM" },
+};
 
-async function ensureMistralApiKey(): Promise<void> {
-  if (process.env.MISTRAL_API_KEY) return; // already set, e.g. local dev via .env
-  mistralApiKeyPromise ??= (async () => {
-    const paramName = process.env.MISTRAL_API_KEY_PARAM;
-    if (!paramName) return; // not configured -- MODEL_PROVIDER isn't "mistral"
+let providerApiKeyPromise: Promise<void> | undefined;
+
+async function ensureProviderApiKey(): Promise<void> {
+  const spec = PROVIDER_KEY_ENV[process.env.MODEL_PROVIDER ?? "bedrock"];
+  if (!spec) return; // Bedrock -- AWS credential chain, no key to fetch
+  if (process.env[spec.key]) return; // already set, e.g. local dev via .env
+  providerApiKeyPromise ??= (async () => {
+    const paramName = process.env[spec.param];
+    if (!paramName) return; // not configured
     const ssm = new SSMClient({});
     const res = await ssm.send(new GetParameterCommand({ Name: paramName, WithDecryption: true }));
     const value = res.Parameter?.Value;
-    if (value) process.env.MISTRAL_API_KEY = value;
+    if (value) process.env[spec.key] = value;
   })();
-  await mistralApiKeyPromise;
+  await providerApiKeyPromise;
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -283,7 +293,7 @@ async function handleMcpRequest(req: IncomingMessage, res: ServerResponse): Prom
 
   try {
     await ensureFastmailToken();
-    await ensureMistralApiKey();
+    await ensureProviderApiKey();
   } catch (err) {
     res
       .writeHead(500, { "content-type": "application/json" })
