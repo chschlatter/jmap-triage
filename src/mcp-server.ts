@@ -13,8 +13,8 @@
 // which just execs this file and proxies HTTP to whatever port it listens
 // on -- no Lambda-specific glue code needed in here.
 //
-// Auth: Fastmail/Bedrock/Mistral/GreenPT credentials are read the same way every
-// other module in this repo reads them (config.ts, process.env) -- this
+// Auth: Fastmail and GreenPT credentials are read the same way every other
+// module in this repo reads them (config.ts, process.env) -- this
 // server runs with its own Lambda execution role and its own SSM
 // parameters (see template.yaml), same SecureString pattern lambda.ts
 // already uses. Auth for the transport itself is a single static bearer
@@ -113,7 +113,7 @@ export function createMcpServer(): McpServer {
     {
       title: "Evaluate candidate prompt",
       description:
-        "Static gate (version bump, JSON-reply shape intact, category vocabulary set-equal to the folder map -- always checked against the FULL vocabulary regardless of `category`), then, only if it passes, replay against corrections and a counterweight sample derived live from JMAP keyword state and prior approval history -- no stored corpus. Returns {gate, fixes, corrections, regressions} -- read-only, no writes. gate.candidateCategories echoes the category names parsed out of the candidate's CATEGORY section, regardless of pass/fail. corrections lists every open mismatch this call attempted to replay, each with status 'fixed' | 'unfixed' | 'error' -- fixes is just the 'fixed' subset, kept for convenience; check corrections when fixes comes back empty to see whether a message is still misclassifying (status 'unfixed', actualCategory shows what the model said instead) or the classify call itself failed (status 'error', see the error field) rather than assuming 'empty fixes' means nothing happened. regressions lists only counterweight rows that broke ('regressed') or errored ('error') -- a row that stayed correct isn't included. Pass `category` to scope the replay to just that one category (recommended when the diff only touches one category's wording -- the common case) for a faster, more thorough per-category check; omit it for a full sweep across all categories. Even scoped, this takes real time (Bedrock classification calls, not a lookup) -- treat anything under a few minutes as expected, not a hang.",
+        "Static gate (version bump, JSON-reply shape intact, category vocabulary set-equal to the folder map -- always checked against the FULL vocabulary regardless of `category`), then, only if it passes, replay against corrections and a counterweight sample derived live from JMAP keyword state and prior approval history -- no stored corpus. Returns {gate, fixes, corrections, regressions} -- read-only, no writes. gate.candidateCategories echoes the category names parsed out of the candidate's CATEGORY section, regardless of pass/fail. corrections lists every open mismatch this call attempted to replay, each with status 'fixed' | 'unfixed' | 'error' -- fixes is just the 'fixed' subset, kept for convenience; check corrections when fixes comes back empty to see whether a message is still misclassifying (status 'unfixed', actualCategory shows what the model said instead) or the classify call itself failed (status 'error', see the error field) rather than assuming 'empty fixes' means nothing happened. regressions lists only counterweight rows that broke ('regressed') or errored ('error') -- a row that stayed correct isn't included. Pass `category` to scope the replay to just that one category (recommended when the diff only touches one category's wording -- the common case) for a faster, more thorough per-category check; omit it for a full sweep across all categories. Even scoped, this takes real time (real classification calls, not a lookup) -- treat anything under a few minutes as expected, not a hang.",
       inputSchema: {
         version: z.string(),
         prompt: z.string(),
@@ -210,56 +210,36 @@ async function isAuthorized(req: IncomingMessage): Promise<boolean> {
   return match?.[1] === expected;
 }
 
-// --- Fastmail token: fetched from SSM at first use, same cold-start-cache
-// pattern lambda.ts uses for TriageFunction's secrets, then exposed to
-// report.ts/evaluate.ts the same way they already read it everywhere else
-// (config.ts's requireFastmailToken(), process.env.FASTMAIL_TOKEN) -- so
-// those modules stay unaware this server fetches it any differently than
-// the CLI/eval path does.
-
-let fastmailTokenPromise: Promise<void> | undefined;
-
-async function ensureFastmailToken(): Promise<void> {
-  if (process.env.FASTMAIL_TOKEN) return; // already set, e.g. local dev via .env
-  fastmailTokenPromise ??= (async () => {
-    const paramName = process.env.FASTMAIL_TOKEN_PARAM;
-    if (!paramName) return; // not configured; requireFastmailToken() will raise its own clear error
-    const ssm = new SSMClient({});
-    const res = await ssm.send(new GetParameterCommand({ Name: paramName, WithDecryption: true }));
-    const value = res.Parameter?.Value;
-    if (value) process.env.FASTMAIL_TOKEN = value;
-  })();
-  await fastmailTokenPromise;
-}
-
-// Same pattern as ensureFastmailToken() above, for evaluate.ts's
-// requireModelConfig() call (used by evaluate_candidate). Only meaningful
-// when MODEL_PROVIDER names a provider that needs an API key -- in Bedrock
-// mode the *_API_KEY_PARAM env vars are simply never set, so this is a silent
-// no-op and evaluate.ts never asks for the value it would have populated.
+// --- Secrets: fetched from SSM at first use, same cold-start-cache pattern
+// lambda.ts uses for TriageFunction's, then exposed through process.env the
+// way every module already reads them (config.ts's require*) -- so those
+// modules stay unaware this server fetches them any differently than the
+// CLI/eval path does.
 //
-// Keyed off the provider rather than one function per provider so adding a
-// fourth is a table entry, not another copy of this block.
-const PROVIDER_KEY_ENV: Record<string, { key: string; param: string }> = {
-  mistral: { key: "MISTRAL_API_KEY", param: "MISTRAL_API_KEY_PARAM" },
-  greenpt: { key: "GREENPT_API_KEY", param: "GREENPT_API_KEY_PARAM" },
-};
+// Populates process.env[envVar] from an SSM SecureString named by
+// process.env[paramEnvVar], once per container. Both credentials the tools
+// need -- FASTMAIL_TOKEN for report.ts/evaluate.ts, GREENPT_API_KEY for
+// evaluate.ts's requireModelConfig() -- load the same way, so this is one
+// helper rather than one function per secret. A missing *_PARAM is a silent
+// no-op: config.ts's require* raises its own clear error if the value is then
+// actually needed, and local dev sets these via .env instead.
+const ssmLoads = new Map<string, Promise<void>>();
 
-let providerApiKeyPromise: Promise<void> | undefined;
-
-async function ensureProviderApiKey(): Promise<void> {
-  const spec = PROVIDER_KEY_ENV[process.env.MODEL_PROVIDER ?? "bedrock"];
-  if (!spec) return; // Bedrock -- AWS credential chain, no key to fetch
-  if (process.env[spec.key]) return; // already set, e.g. local dev via .env
-  providerApiKeyPromise ??= (async () => {
-    const paramName = process.env[spec.param];
-    if (!paramName) return; // not configured
-    const ssm = new SSMClient({});
-    const res = await ssm.send(new GetParameterCommand({ Name: paramName, WithDecryption: true }));
-    const value = res.Parameter?.Value;
-    if (value) process.env[spec.key] = value;
-  })();
-  await providerApiKeyPromise;
+function ensureEnvFromSsm(envVar: string, paramEnvVar: string): Promise<void> {
+  if (process.env[envVar]) return Promise.resolve();
+  let load = ssmLoads.get(envVar);
+  if (!load) {
+    load = (async () => {
+      const paramName = process.env[paramEnvVar];
+      if (!paramName) return;
+      const ssm = new SSMClient({});
+      const res = await ssm.send(new GetParameterCommand({ Name: paramName, WithDecryption: true }));
+      const value = res.Parameter?.Value;
+      if (value) process.env[envVar] = value;
+    })();
+    ssmLoads.set(envVar, load);
+  }
+  return load;
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -292,8 +272,8 @@ async function handleMcpRequest(req: IncomingMessage, res: ServerResponse): Prom
   }
 
   try {
-    await ensureFastmailToken();
-    await ensureProviderApiKey();
+    await ensureEnvFromSsm("FASTMAIL_TOKEN", "FASTMAIL_TOKEN_PARAM");
+    await ensureEnvFromSsm("GREENPT_API_KEY", "GREENPT_API_KEY_PARAM");
   } catch (err) {
     res
       .writeHead(500, { "content-type": "application/json" })

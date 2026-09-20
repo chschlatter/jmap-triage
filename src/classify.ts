@@ -1,28 +1,21 @@
-// Classification via one of three providers, chosen by MODEL_PROVIDER (see
-// config.ts's requireModelConfig()):
-//   bedrock -- AWS Bedrock Converse, model chosen by BEDROCK_MODEL_ID.
-//   mistral -- api.mistral.ai directly, model chosen by MISTRAL_MODEL_ID.
-//   greenpt -- api.greenpt.ai directly, model chosen by GREENPT_MODEL_ID.
-//              Utrecht NL, renewable EU datacenters, EU-owned rather than
-//              merely EU-region (which is what Bedrock eu-central-1 gives).
-// Mistral and GreenPT are both plain OpenAI chat-completions APIs and share
-// invokeOpenAICompatible() below; only the base URL differs. Changing any
-// model id also needs a matching entry in model-pacing.ts, or classification
-// falls back to conservative pacing rather than the model's real quota.
+// Classification against GreenPT (api.greenpt.ai), a plain OpenAI
+// chat-completions API. One email per call -- see DECISIONS.md for why this
+// provider, why one email, and what the rollback path is if GreenPT fails.
+//
+// Changing GREENPT_MODEL_ID also needs a matching entry in model-pacing.ts,
+// or classification runs at the conservative default rather than the model's
+// measured pacing.
 
-import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 import type { TriageEmail } from "./fetch-emails.js";
 
-export const CLASSIFY_BATCH_SIZE = 1;
+const GREENPT_API_URL = "https://api.greenpt.ai/v1/chat/completions";
 const MAX_RETRIES = 5;
 const RETRY_BASE_DELAY_MS = 1000;
-const MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions";
-const GREENPT_API_URL = "https://api.greenpt.ai/v1/chat/completions";
 
-export type ClassifierConfig =
-  | { provider: "bedrock"; client: BedrockRuntimeClient; modelId: string }
-  | { provider: "mistral"; apiKey: string; modelId: string }
-  | { provider: "greenpt"; apiKey: string; modelId: string };
+export interface ClassifierConfig {
+  apiKey: string;
+  modelId: string;
+}
 
 export type ClassificationOutcome =
   | { id: string; category: string; notify: boolean }
@@ -62,78 +55,25 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Bedrock throttles fairly aggressively under sequential load. Retry with
-// backoff on throttling rather than assume it won't happen.
-//
-// Goes through Bedrock's Converse API rather than InvokeModel with a
-// hand-built Anthropic Messages-on-Bedrock body (anthropic_version,
-// content[0].text) -- that schema is Anthropic-specific and doesn't work
-// against non-Anthropic models (e.g. Qwen). Converse is the documented
-// cross-provider interface, so modelId alone decides which model runs;
-// nothing else here is Anthropic-specific.
-async function invokeBedrock(
-  client: BedrockRuntimeClient,
-  modelId: string,
-  promptText: string,
-  userContent: string,
-  maxTokens: number
-): Promise<string> {
-  for (let attempt = 0; ; attempt++) {
-    try {
-      const response = await client.send(
-        new ConverseCommand({
-          modelId,
-          system: [{ text: promptText }],
-          messages: [{ role: "user", content: [{ text: userContent }] }],
-          inferenceConfig: { maxTokens, temperature: 0 },
-        })
-      );
-      // Reasoning-first models (e.g. gpt-oss, MiniMax) emit a
-      // reasoningContent block ahead of the actual answer -- content[0] is
-      // not reliably the text block the way it is for direct-answer models,
-      // so scan for the first block that has one instead of indexing.
-      const text = response.output?.message?.content?.find((block) => typeof block.text === "string")?.text;
-      if (typeof text !== "string") {
-        throw new Error(`No text content in Bedrock response: ${JSON.stringify(response.output)}`);
-      }
-      return text;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      const throttled = message.includes("Too many requests") || message.includes("Throttling");
-      if (!throttled || attempt >= MAX_RETRIES) throw err;
-      await sleep(RETRY_BASE_DELAY_MS * 2 ** attempt);
-    }
-  }
-}
-
-// A provider's own EU-hosted OpenAI-compatible endpoint (api.mistral.ai or
-// api.greenpt.ai), not Bedrock -- no cross-region inference profile or AWS
-// credential chain involved, just an API key and a base URL. Retries on 429
-// the same way invokeBedrock retries on throttling; Mistral's tier needs
-// real backoff (see model-pacing.ts for the empirically-measured pacing that
-// keeps this from firing at all), GreenPT measured clean at concurrency 8.
-//
-// Note that a 429 here is not necessarily throttling: GreenPT returns 402
-// Payment Required on exhausted credits, but some gateways signal an empty
-// balance as a 429 with an insufficient_quota code. Retrying that just burns
-// the backoff ladder, so it is surfaced rather than retried.
+// Retries on 429. Note that a 429 is not necessarily throttling: GreenPT
+// returns 402 Payment Required on exhausted credits, but some gateways signal
+// an empty balance as a 429 with an insufficient_quota code. Retrying that
+// just burns the backoff ladder, so it is surfaced rather than retried.
 async function invokeOpenAICompatible(
-  apiUrl: string,
-  apiKey: string,
-  modelId: string,
+  config: ClassifierConfig,
   systemText: string,
   userContent: string,
   maxTokens: number
 ): Promise<string> {
   for (let attempt = 0; ; attempt++) {
-    const response = await fetch(apiUrl, {
+    const response = await fetch(GREENPT_API_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${config.apiKey}`,
       },
       body: JSON.stringify({
-        model: modelId,
+        model: config.modelId,
         temperature: 0,
         max_tokens: maxTokens,
         messages: [
@@ -147,7 +87,7 @@ async function invokeOpenAICompatible(
       const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
       const text = data.choices?.[0]?.message?.content;
       if (typeof text !== "string") {
-        throw new Error(`No text content in response from ${apiUrl}: ${JSON.stringify(data)}`);
+        throw new Error(`No text content in response from ${GREENPT_API_URL}: ${JSON.stringify(data)}`);
       }
       return text;
     }
@@ -159,107 +99,77 @@ async function invokeOpenAICompatible(
     const billing = response.status === 402 || /insufficient_quota|billing_error/.test(body);
     const throttled = response.status === 429 && !billing;
     if (!throttled || attempt >= MAX_RETRIES) {
-      throw new Error(`API error ${response.status} from ${apiUrl}: ${body.slice(0, 300)}`);
+      throw new Error(`API error ${response.status} from ${GREENPT_API_URL}: ${body.slice(0, 300)}`);
     }
     await sleep(RETRY_BASE_DELAY_MS * 2 ** attempt);
   }
 }
 
-// Shared by both providers -- JSON extraction, per-id lookup, and notify's
-// fail-closed coercion (missing/non-boolean -> false rather than erroring
-// the whole email out; a lost notification is a mild inconvenience, but a
-// bad batch response shouldn't leave the email stuck in Inbox/Triage over
-// one malformed field) don't depend on which provider produced responseText.
-export function parseClassificationResponse(responseText: string, emails: TriageEmail[]): ClassificationOutcome[] {
+// notify is coerced fail-closed (missing/non-boolean -> false rather than
+// erroring the email out): a lost notification is a mild inconvenience, but a
+// malformed field shouldn't leave the email stuck in Inbox/Triage.
+export function parseClassificationResponse(responseText: string, email: TriageEmail): ClassificationOutcome {
   const candidate = extractJsonArray(responseText) ?? responseText;
   let parsed: unknown;
   try {
     parsed = JSON.parse(candidate);
   } catch {
-    const message = `Response was not valid JSON: ${responseText.slice(0, 200)}`;
-    return emails.map((e) => ({ id: e.id, error: message }));
+    return { id: email.id, error: `Response was not valid JSON: ${responseText.slice(0, 200)}` };
   }
 
   if (!Array.isArray(parsed)) {
-    const message = `Response was not a JSON array: ${responseText.slice(0, 200)}`;
-    return emails.map((e) => ({ id: e.id, error: message }));
+    return { id: email.id, error: `Response was not a JSON array: ${responseText.slice(0, 200)}` };
   }
 
-  const byId = new Map<string, { category: string; notify: boolean }>();
+  // The prompt describes an array-in/array-out contract, so the reply is an
+  // array of one -- match on id rather than taking [0], so a model that
+  // echoes something unexpected fails loudly instead of being misattributed.
   for (const item of parsed as Array<{ id?: unknown; category?: unknown; notify?: unknown }>) {
-    if (typeof item.id === "string" && typeof item.category === "string") {
-      byId.set(item.id, { category: item.category, notify: item.notify === true });
+    if (item.id === email.id && typeof item.category === "string") {
+      return { id: email.id, category: item.category, notify: item.notify === true };
     }
   }
-
-  return emails.map((e) => {
-    const result = byId.get(e.id);
-    if (!result) {
-      return { id: e.id, error: `Missing from batch response: ${responseText.slice(0, 200)}` };
-    }
-    return { id: e.id, category: result.category, notify: result.notify };
-  });
+  return { id: email.id, error: `Missing from response: ${responseText.slice(0, 200)}` };
 }
 
-// Request-body shape and output budget, factored out of classifyBatch so an
-// eval script benchmarking an alternative transport (eval/run-eval-melious.ts)
-// can send the byte-identical request and grade with the identical parser --
-// only the HTTP call differs, which is what keeps its accuracy numbers
-// comparable to the production Bedrock baseline instead of measuring a
-// re-implementation's drift.
-export function buildClassifyUserContent(emails: TriageEmail[]): string {
-  return JSON.stringify(
-    emails.map((e) => ({
-      id: e.id,
-      subject: e.subject,
-      from: e.from,
-      to: e.to,
-      receivedAt: e.receivedAt,
-      body: e.body,
-      attachments: e.attachments,
-    }))
-  );
+// Wraps the single email in a one-element array: the prompt describes a JSON
+// array of emails in and a JSON array of results out, so the wire format stays
+// an array even though only one email is ever sent. Exported so an eval can
+// send the byte-identical request.
+export function buildClassifyUserContent(email: TriageEmail): string {
+  return JSON.stringify([
+    {
+      id: email.id,
+      subject: email.subject,
+      from: email.from,
+      to: email.to,
+      receivedAt: email.receivedAt,
+      body: email.body,
+      attachments: email.attachments,
+    },
+  ]);
 }
 
-// ~150 tokens/email covers the id/category/notify JSON itself, but
-// reasoning-first models (gpt-oss, MiniMax, GLM) spend additional tokens on a
-// reasoning block *before* emitting that JSON -- observed ~100-150 reasoning
-// tokens on a trivial test email, more expected on real classification
-// decisions. 1000/email leaves headroom for that without costing anything
-// extra for direct-answer models (every provider here bills actual output
-// tokens, not maxTokens), still capped well under the 4096 ceiling at
-// CLASSIFY_BATCH_SIZE=1.
-export function classifyMaxTokens(emails: TriageEmail[]): number {
-  return Math.min(4096, 1000 * emails.length + 200);
-}
+// ~150 tokens covers the id/category/notify JSON itself, but reasoning-first
+// models spend additional tokens on a reasoning block *before* emitting that
+// JSON. 1200 leaves headroom for that and costs nothing extra (GreenPT bills
+// actual output tokens, not maxTokens).
+export const CLASSIFY_MAX_TOKENS = 1200;
 
-export async function classifyBatch(
+export async function classifyEmail(
   config: ClassifierConfig,
-  emails: TriageEmail[],
+  email: TriageEmail,
   // Required, no bundled-constant default -- there is no local fallback
-  // prompt (see current-prompt.ts's header comment on why one shouldn't
-  // exist: the real prompt describes a specific person, so a "safe to
-  // commit" bundled copy would have to be either generic-and-wrong or
-  // PII-bearing-and-uncommittable). Every caller fetches the live prompt
-  // from S3 first (getCurrentPrompt()) and passes it in explicitly.
+  // prompt (see DECISIONS.md, "no bundled local prompt"). Every caller
+  // fetches the live prompt from S3 first and passes it in explicitly.
   promptText: string
-): Promise<ClassificationOutcome[]> {
-  const userContent = buildClassifyUserContent(emails);
-
-  const maxTokens = classifyMaxTokens(emails);
-
+): Promise<ClassificationOutcome> {
   let responseText: string;
   try {
-    if (config.provider === "bedrock") {
-      responseText = await invokeBedrock(config.client, config.modelId, promptText, userContent, maxTokens);
-    } else {
-      const apiUrl = config.provider === "mistral" ? MISTRAL_API_URL : GREENPT_API_URL;
-      responseText = await invokeOpenAICompatible(apiUrl, config.apiKey, config.modelId, promptText, userContent, maxTokens);
-    }
+    responseText = await invokeOpenAICompatible(config, promptText, buildClassifyUserContent(email), CLASSIFY_MAX_TOKENS);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return emails.map((e) => ({ id: e.id, error: message }));
+    return { id: email.id, error: err instanceof Error ? err.message : String(err) };
   }
 
-  return parseClassificationResponse(responseText, emails);
+  return parseClassificationResponse(responseText, email);
 }

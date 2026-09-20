@@ -1,10 +1,9 @@
 // Classification eval -- NOT part of the deployed pipeline and NOT run in
 // CI. Runs the synthetic fixtures in golden-set.ts through the real
-// classifyBatch() against whichever classifier MODEL_PROVIDER selects, and
-// reports category/notify mismatches against the CURRENTLY LIVE prompt
-// (S3's current.json, fetched via getCurrentPrompt() -- there is no
-// bundled local prompt.ts to test against instead; see current-prompt.ts's
-// header comment for why). Isolated to the classify stage on purpose: no
+// classifyEmail() and reports category/notify mismatches against the
+// CURRENTLY LIVE prompt (S3's current.json, fetched via getCurrentPrompt() --
+// there is no bundled local prompt to test against instead, see
+// DECISIONS.md). Isolated to the classify stage on purpose: no
 // JMAP session, no mailboxes, no moves, no Pushover -- it exists to catch
 // a prompt approval that silently breaks a rule the prompt already relies
 // on, quickly and without touching Fastmail. See golden-set.ts for what
@@ -15,7 +14,7 @@
 // Exits non-zero if any category mismatch is found.
 
 import { loadEnvFile, requireModelConfig } from "../src/config.js";
-import { classifyBatch, type ClassificationOutcome } from "../src/classify.js";
+import { classifyEmail, type ClassificationOutcome } from "../src/classify.js";
 import { getConcurrency, runPaced } from "../src/model-pacing.js";
 import { getCurrentPrompt } from "../src/current-prompt.js";
 import { GOLDEN_SET } from "./golden-set.js";
@@ -62,21 +61,18 @@ async function main() {
   await loadEnvFile();
   const model = requireModelConfig();
   const current = await getCurrentPrompt();
-  // Mirrors classify.ts's CLASSIFY_BATCH_SIZE=1 production behavior: emails
-  // are sent to the model one at a time, not batched, so this eval reflects
-  // what actually gets asked of the model at runtime. Concurrency, pacing
-  // and the burst-cap cooldown all come from model-pacing.ts's runPaced().
+  // Concurrency, pacing and the burst-cap cooldown all come from
+  // model-pacing.ts's runPaced(), same as production.
   console.log(
-    `Evaluating classify.ts against live prompt ${current.version} (provider: ${model.provider}, model: ${model.modelId}, ` +
-      `concurrency: ${getConcurrency(model.provider, model.modelId)})`
+    `Evaluating classify.ts against live prompt ${current.version} ` +
+      `(model: ${model.modelId}, concurrency: ${getConcurrency()})`
   );
   console.log(`${GOLDEN_SET.length} case(s)\n`);
 
   // Progress lines below may print out of GOLDEN_SET order when
   // concurrency > 1 -- rows[] itself stays correctly indexed regardless.
-  const rows = await runPaced(GOLDEN_SET, model.provider, model.modelId, async (c) => {
-    const [outcome] = await classifyBatch(model, [c], current.prompt);
-    return buildRow(c, outcome);
+  const rows = await runPaced(GOLDEN_SET, model.modelId, async (c) => {
+    return buildRow(c, await classifyEmail(model, c, current.prompt));
   }, (row, c, i) => {
     const status = row.error ? `ERROR: ${row.error}` : row.categoryOk && row.notifyOk !== false ? "ok" : "MISMATCH";
     console.log(`[${i + 1}/${GOLDEN_SET.length}] ${c.id}... ${status}`);

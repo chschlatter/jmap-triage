@@ -1,13 +1,16 @@
 // .env loading, CLI flag parsing, and env-var validation. Kept separate from
 // the modules that consume the values so a new required env var or flag
 // touches one file, not the orchestration logic in main.ts.
+//
+// Error messages here name the missing variable and point at README.md's
+// Configuration section rather than inlining setup instructions -- they fire
+// for one operator on a machine that either has a working .env or needs the
+// README anyway.
 
-import { BedrockRuntimeClient } from "@aws-sdk/client-bedrock-runtime";
 import { MAILBOX_SPECS, type MailboxOverrides } from "./mailboxes.js";
 import type { ClassifierConfig } from "./classify.js";
 
 const DEFAULT_LIMIT = 20;
-const BEDROCK_REGION = "eu-central-1";
 
 export async function loadEnvFile(path = ".env") {
   const fs = await import("node:fs/promises");
@@ -46,87 +49,30 @@ export function parseArgs(argv: string[]): CliOptions {
   return { limit: parseLimit(argv), apply, notify };
 }
 
+function requireEnv(name: string, purpose: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`${name} is not set (${purpose}). See README.md, Configuration.`);
+  }
+  return value;
+}
+
 export function requireFastmailToken(): string {
-  const token = process.env.FASTMAIL_TOKEN;
-  if (!token) {
-    throw new Error(
-      "Error: FASTMAIL_TOKEN environment variable is not set.\n" +
-        "Create an API token at https://app.fastmail.com/settings/security/tokens\n" +
-        "Scope: Mail (read/write -- v5 moves mail between mailboxes when run with --apply).\n" +
-        "then run: FASTMAIL_TOKEN=fmu1-... npx tsx triage.ts"
-    );
-  }
-  return token;
+  return requireEnv("FASTMAIL_TOKEN", "Fastmail API token, Mail read/write scope");
 }
 
-export function requireBedrockModelId(): string {
-  const modelId = process.env.BEDROCK_MODEL_ID;
-  if (!modelId) {
-    throw new Error(
-      "Error: BEDROCK_MODEL_ID environment variable is not set.\n" +
-        "Bedrock model IDs change over time, so this script does not hardcode one.\n" +
-        "Look up the current Claude Haiku model available in eu-central-1:\n" +
-        "  aws bedrock list-foundation-models --region eu-central-1 --by-provider anthropic \\\n" +
-        "    --query \"modelSummaries[?contains(modelId,'haiku')].modelId\"\n" +
-        "If that model isn't directly invokable in eu-central-1 (some models require a\n" +
-        "cross-region inference profile), also check:\n" +
-        "  aws bedrock list-inference-profiles --region eu-central-1 \\\n" +
-        "    --query \"inferenceProfileSummaries[?contains(inferenceProfileId,'haiku')].inferenceProfileId\"\n" +
-        "Then set BEDROCK_MODEL_ID in .env."
-    );
-  }
-  return modelId;
-}
-
-// Provider-agnostic entrypoint every non-Lambda caller (CLI main(),
-// evaluate.ts inside McpServerFunction) uses instead of reaching for
-// requireBedrockModelId() directly -- MODEL_PROVIDER picks which of the three
-// underlying providers actually classifies. Defaults to "bedrock" when
-// unset so an existing .env with only BEDROCK_MODEL_ID keeps working
-// unchanged. lambda.ts does NOT use this: TriageFunction threads its three
-// secrets through explicitly rather than mutating process.env (see its own
-// loadSecrets()), so it builds its ClassifierConfig inline instead.
+// Used by every non-Lambda caller (CLI main(), evaluate.ts inside
+// McpServerFunction). lambda.ts does NOT use this: TriageFunction threads its
+// secrets through explicitly rather than mutating process.env, so it builds
+// its ClassifierConfig inline instead.
 export function requireModelConfig(): ClassifierConfig {
-  const provider = process.env.MODEL_PROVIDER ?? "bedrock";
-
-  if (provider === "mistral") {
-    const apiKey = process.env.MISTRAL_API_KEY;
-    const modelId = process.env.MISTRAL_MODEL_ID;
-    if (!apiKey || !modelId) {
-      throw new Error(
-        "Error: MISTRAL_API_KEY and MISTRAL_MODEL_ID environment variables are both required\n" +
-          "when MODEL_PROVIDER=mistral.\n" +
-          "Create a key at https://console.mistral.ai/ and check which models your account's\n" +
-          "tier can actually call (some, e.g. mistral-large-latest, return a 403\n" +
-          "tier_not_allowed on lower tiers -- verify with a direct API call before setting\n" +
-          "MISTRAL_MODEL_ID, don't assume the name from Mistral's docs is available).\n" +
-          "Then set both in .env."
-      );
-    }
-    return { provider: "mistral", apiKey, modelId };
-  }
-
-  if (provider === "greenpt") {
-    const apiKey = process.env.GREENPT_API_KEY;
-    const modelId = process.env.GREENPT_MODEL_ID;
-    if (!apiKey || !modelId) {
-      throw new Error(
-        "Error: GREENPT_API_KEY and GREENPT_MODEL_ID environment variables are both required\n" +
-          "when MODEL_PROVIDER=greenpt.\n" +
-          "Create an API-only account at https://greenpt.com -- it has no monthly fee despite\n" +
-          "the pricing page's subscription wording, bills per token, and its credits do not\n" +
-          "expire. Confirm the model id against GET https://api.greenpt.ai/v1/models rather\n" +
-          "than trusting the docs: a plan restriction can hide a model your key cannot call,\n" +
-          "which is how Mistral's 403 tier_not_allowed went unnoticed. Then set both in .env."
-      );
-    }
-    return { provider: "greenpt", apiKey, modelId };
-  }
-
-  if (provider !== "bedrock") {
-    throw new Error(`Error: Unknown MODEL_PROVIDER "${provider}" -- expected "bedrock", "mistral" or "greenpt".`);
-  }
-  return { provider: "bedrock", client: new BedrockRuntimeClient({ region: BEDROCK_REGION }), modelId: requireBedrockModelId() };
+  return {
+    apiKey: requireEnv("GREENPT_API_KEY", "GreenPT API key, greenpt.com"),
+    // Verify a new id against GET https://api.greenpt.ai/v1/models before
+    // setting it -- a plan restriction can hide a model the key cannot
+    // invoke (DECISIONS.md, 2026-09-06).
+    modelId: requireEnv("GREENPT_MODEL_ID", "GreenPT model id, e.g. glm-5.3-flash"),
+  };
 }
 
 export interface PushoverConfig {
@@ -135,34 +81,18 @@ export interface PushoverConfig {
 }
 
 export function requirePushoverConfig(): PushoverConfig {
-  const token = process.env.PUSHOVER_TOKEN;
-  const user = process.env.PUSHOVER_USER;
-  if (!token || !user) {
-    throw new Error(
-      "Error: PUSHOVER_TOKEN and PUSHOVER_USER environment variables are required to send\n" +
-        "notifications (any email the model marks notify: true, on a successful --apply run).\n" +
-        "Create an application at https://pushover.net/apps/build for a token, and find your\n" +
-        "user key on your Pushover dashboard at https://pushover.net/.\n" +
-        "Pass --no-notify to run --apply without sending notifications instead."
-    );
-  }
-  return { token, user };
+  return {
+    token: requireEnv("PUSHOVER_TOKEN", "Pushover application token; or pass --no-notify"),
+    user: requireEnv("PUSHOVER_USER", "Pushover user key; or pass --no-notify"),
+  };
 }
 
-// S3 bucket holding current.json / history/* -- see ARCHITECTURE.md.
-// Read by every classify-path caller's live prompt fetch (current-prompt.ts)
-// and by every jmap-triage-mcp tool. One bucket, one env var name, shared by
-// both deployables -- see template.yaml.
+// S3 bucket holding current.json / history/* -- see ARCHITECTURE.md. Read by
+// every classify-path caller's live prompt fetch (current-prompt.ts) and by
+// every jmap-triage-mcp tool. One bucket, one env var name, shared by both
+// deployables -- see template.yaml.
 export function requirePromptBucket(): string {
-  const bucket = process.env.PROMPT_BUCKET;
-  if (!bucket) {
-    throw new Error(
-      "Error: PROMPT_BUCKET environment variable is not set.\n" +
-        "This is the S3 bucket holding current.json and history/* -- see\n" +
-        "ARCHITECTURE.md's prompt section."
-    );
-  }
-  return bucket;
+  return requireEnv("PROMPT_BUCKET", "S3 bucket holding current.json and history/*");
 }
 
 export type { MailboxOverrides };

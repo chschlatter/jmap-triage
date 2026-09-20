@@ -1,72 +1,26 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  jmap-triage: polls Inbox/Triage, classifies with a Bedrock, Mistral or
-  GreenPT model (chosen by the ModelProvider parameter -- see classify.ts), moves
-  mail, and notifies via Pushover. See ARCHITECTURE.md for the full
-  design.
+  jmap-triage: polls Inbox/Triage, classifies with a GreenPT model (see
+  classify.ts), moves mail, and notifies via Pushover. See ARCHITECTURE.md
+  for the full design, DECISIONS.md for why GreenPT.
 
 Parameters:
-  ModelProvider:
-    Type: String
-    Default: bedrock
-    AllowedValues: ["bedrock", "mistral", "greenpt"]
-    Description: >
-      Which of classify.ts's three classifier backends TriageFunction and
-      McpServerFunction (the evaluate_candidate replay) use. Defaults to
-      "bedrock" so a plain redeploy without new parameter_overrides can't
-      accidentally start depending on provider secrets that were never
-      created. Switching is the whole cutover -- no code change, no other
-      parameter is required to change with it.
-  BedrockModelId:
-    Type: String
-    Description: >
-      Bedrock model id (on-demand id or cross-region inference profile id)
-      for eu-central-1 that classify.ts's Converse-based invokeBedrock calls
-      -- see README.md prereq 3. Not hardcoded because both which model is
-      chosen and Bedrock model ids in general change over time. Still
-      required even when ModelProvider=mistral (CloudFormation parameters
-      without a Default are always required) -- keeping a real value here is
-      what makes switching back to ModelProvider=bedrock a config-only
-      rollback with no redeploy-time surprises.
-  MistralModelId:
-    Type: String
-    Default: mistral-medium-latest
-    Description: >
-      Model id classify.ts's invokeMistral calls directly against
-      api.mistral.ai (not Bedrock) when ModelProvider=mistral. Not every
-      model name Mistral documents is available on every account's
-      subscription tier -- mistral-large-latest returned 403
-      tier_not_allowed on this account when checked directly; verify with a
-      real API call before changing this, don't assume from the model list
-      endpoint alone (it lists models the tier can't actually invoke).
-  MistralApiKeyParam:
-    Type: String
-    Default: /jmap-triage/mistral-api-key
-    Description: >
-      Name (not value) of the SecureString SSM parameter holding the
-      Mistral API key (console.mistral.ai). Only fetched at runtime when
-      ModelProvider=mistral -- create it out of band, same as
-      FastmailTokenParam, before switching ModelProvider to "mistral".
   GreenptModelId:
     Type: String
     Default: glm-5.3-flash
     Description: >
-      Model id classify.ts's invokeOpenAICompatible calls against
-      api.greenpt.ai (not Bedrock) when ModelProvider=greenpt. Verify against
-      GET https://api.greenpt.ai/v1/models before changing -- a plan
-      restriction can hide a model the key cannot actually invoke, which is
-      how Mistral's 403 tier_not_allowed went unnoticed. glm-5.3-flash was
-      measured on the 36-case golden set at 35-36/36 category and 30-31/36
-      notify, at or above the qwen3-235b-a22b Bedrock baseline it replaced.
+      Model id classify.ts calls against api.greenpt.ai. Verify against GET
+      https://api.greenpt.ai/v1/models before changing -- a plan restriction
+      can hide a model the key cannot actually invoke. Pacing for a new model
+      belongs in model-pacing.ts, measured. See DECISIONS.md.
   GreenptApiKeyParam:
     Type: String
     Default: /jmap-triage/greenpt-api-key
     Description: >
       Name (not value) of the SecureString SSM parameter holding the GreenPT
-      API key (greenpt.com, API-only account -- no monthly fee). Only fetched
-      at runtime when ModelProvider=greenpt -- create it out of band, same as
-      FastmailTokenParam, before switching ModelProvider to "greenpt".
+      API key (greenpt.com, API-only account -- no monthly fee). Created out
+      of band, same as FastmailTokenParam.
   TriageMailboxId:
     Type: String
     Description: Inbox/Triage mailbox id (source).
@@ -183,10 +137,6 @@ Resources:
       # quota is raised.
       Environment:
         Variables:
-          MODEL_PROVIDER: !Ref ModelProvider
-          BEDROCK_MODEL_ID: !Ref BedrockModelId
-          MISTRAL_MODEL_ID: !Ref MistralModelId
-          MISTRAL_API_KEY_PARAM: !Ref MistralApiKeyParam
           GREENPT_MODEL_ID: !Ref GreenptModelId
           GREENPT_API_KEY_PARAM: !Ref GreenptApiKeyParam
           TRIAGE_MAILBOX_ID: !Ref TriageMailboxId
@@ -210,31 +160,6 @@ Resources:
               # here, and no write access: this function only ever reads the
               # live pointer, never approves a version.
               Resource: !Sub "${PromptStoreBucket.Arn}/current.json"
-            - Sid: InvokeBedrockClassifier
-              Effect: Allow
-              # classify.ts calls Bedrock's Converse API (model-agnostic,
-              # not Anthropic-specific); Converse authorizes on the same
-              # bedrock:InvokeModel action as InvokeModel itself. Granted
-              # unconditionally (not gated on ModelProvider) -- IAM
-              # permissions are static at deploy time, and this is what
-              # keeps ModelProvider=bedrock a same-artifact rollback with no
-              # redeploy-time IAM surprise.
-              Action: bedrock:InvokeModel
-              # BedrockModelId may be either a directly-invokable on-demand
-              # model id (e.g. Qwen3 235B) or a cross-region inference
-              # profile (e.g. eu.anthropic.claude-haiku-4-5-...). For a
-              # profile, Bedrock checks IAM permission on *both* the
-              # inference-profile ARN (this account/region) and the
-              # underlying foundation-model ARN in whichever region the
-              # profile routes to, which for an "eu."-prefixed profile can
-              # be any EU region, not just where this stack is deployed --
-              # so both resource lines stay regardless of which kind of id
-              # BedrockModelId currently holds. Narrowed off "*" only
-              # insofar as region/account go -- narrowing to the specific
-              # model id itself is deferred, not currently a priority.
-              Resource:
-                - !Sub arn:aws:bedrock:*::foundation-model/*
-                - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*
             - Sid: ReadTriageSecrets
               Effect: Allow
               Action:
@@ -243,16 +168,10 @@ Resources:
               # Param name Parameters (FastmailTokenParam etc.) already
               # include their leading "/" -- concatenated directly onto
               # "parameter" per the SSM ARN format, not "parameter/${name}".
-              # MistralApiKeyParam included unconditionally, same reasoning
-              # as InvokeBedrockClassifier above -- granting IAM read access
-              # doesn't require the parameter to actually exist yet, so this
-              # doesn't force out-of-band secret creation on a Bedrock-mode
-              # deploy.
               Resource:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${FastmailTokenParam}
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PushoverTokenParam}
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PushoverUserParam}
-                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MistralApiKeyParam}
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GreenptApiKeyParam}
 
   # Defined as raw CloudFormation, not SAM's `Events: Schedule:` shorthand
@@ -310,8 +229,7 @@ Resources:
       Handler: run.sh
       Runtime: nodejs24.x
       # evaluate_candidate's replay (evaluate.ts) classifies open
-      # corrections plus a counterweight sample via whichever provider
-      # MODEL_PROVIDER selects, sequentially and paced (model-pacing.ts) --
+      # corrections plus a counterweight sample, paced (model-pacing.ts) --
       # a concurrent worker pool was tried and measured to buy zero net
       # speedup against this account's rate limits while causing occasional
       # outright call failures, see evaluate.ts's own comments. Claude
@@ -336,10 +254,6 @@ Resources:
           AWS_LWA_INVOKE_MODE: response_stream
           PORT: "8080"
           PROMPT_BUCKET: !Ref PromptStoreBucket
-          MODEL_PROVIDER: !Ref ModelProvider
-          BEDROCK_MODEL_ID: !Ref BedrockModelId
-          MISTRAL_MODEL_ID: !Ref MistralModelId
-          MISTRAL_API_KEY_PARAM: !Ref MistralApiKeyParam
           GREENPT_MODEL_ID: !Ref GreenptModelId
           GREENPT_API_KEY_PARAM: !Ref GreenptApiKeyParam
           FASTMAIL_TOKEN_PARAM: !Ref FastmailTokenParam
@@ -379,27 +293,14 @@ Resources:
               # grant. Scoped to the bucket itself, not its
               # objects.
               Resource: !GetAtt PromptStoreBucket.Arn
-            - Sid: InvokeBedrockClassifier
-              Effect: Allow
-              Action: bedrock:InvokeModel
-              Resource:
-                - !Sub arn:aws:bedrock:*::foundation-model/*
-                - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*
             - Sid: ReadMcpSecrets
               Effect: Allow
               Action:
                 - ssm:GetParameter
                 - ssm:GetParameters
-              # MistralApiKeyParam included unconditionally, same reasoning
-              # as TriageFunction's ReadTriageSecrets grant above -- needed
-              # so evaluate.ts's requireModelConfig() (via
-              # mcp-server.ts's ensureMistralApiKey()) can read it whenever
-              # ModelProvider=mistral, without forcing this on a
-              # Bedrock-mode deploy.
               Resource:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${FastmailTokenParam}
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${McpBearerTokenParam}
-                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MistralApiKeyParam}
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GreenptApiKeyParam}
 
 Outputs:

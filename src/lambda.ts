@@ -1,24 +1,18 @@
 // Lambda entrypoint. Assembles the same PipelineConfig the CLI's main()
 // builds from argv/.env, but from Lambda's own config sources instead: the
-// secrets (FASTMAIL_TOKEN, PUSHOVER_TOKEN, PUSHOVER_USER, and the active
-// provider's API key when MODEL_PROVIDER is mistral or greenpt) come from SSM
-// Parameter Store SecureStrings, fetched once per container and cached across
-// warm invocations; everything else (BEDROCK_MODEL_ID, MODEL_PROVIDER,
-// MISTRAL_MODEL_ID, GREENPT_MODEL_ID, the six mailbox id overrides, LIMIT) is
-// a plain Lambda env var.
+// secrets (FASTMAIL_TOKEN, PUSHOVER_TOKEN, PUSHOVER_USER, GREENPT_API_KEY)
+// come from SSM Parameter Store SecureStrings, fetched once per container and
+// cached across warm invocations; everything else (GREENPT_MODEL_ID, the six
+// mailbox id overrides, LIMIT) is a plain Lambda env var.
 //
-// The classification prompt itself is also fetched once per container and
-// cached across warm invocations, from S3's current.json -- the live
-// pointer jmap-triage-mcp's approve_prompt_diff writes (see loadPrompt()
-// below). This is what makes a prompt approval in the review loop actually
-// change what production classifies with. There is no bundled local
-// fallback (no prompt.ts) -- the real prompt describes a specific person,
-// so a "safe to commit" bundled copy would have to be either generic-and-
-// wrong or PII-bearing-and-uncommittable; see current-prompt.ts's header
-// comment. A failed S3 fetch is therefore fatal, same as a failed secrets
-// fetch below, not a silent degrade.
+// The classification prompt is also fetched once per container and cached the
+// same way, from S3's current.json -- the live pointer jmap-triage-mcp's
+// approve_prompt_diff writes. That is what makes a prompt approval in the
+// review loop actually change what production classifies with. There is no
+// bundled local fallback (DECISIONS.md, "no bundled local prompt"), so a
+// failed S3 fetch is fatal, same as a failed secrets fetch, not a silent
+// degrade.
 
-import { BedrockRuntimeClient } from "@aws-sdk/client-bedrock-runtime";
 import { SSMClient, GetParametersCommand } from "@aws-sdk/client-ssm";
 import { readMailboxOverrides, type PushoverConfig } from "./config.js";
 import type { ClassifierConfig } from "./classify.js";
@@ -26,26 +20,12 @@ import { getCurrentPrompt } from "./current-prompt.js";
 import { runPipeline } from "./main.js";
 
 const DEFAULT_LIMIT = 20;
-const BEDROCK_REGION = "eu-central-1";
-
-// Which SSM-parameter-name env var holds the API key for each non-Bedrock
-// provider. Bedrock is absent on purpose: it authenticates through the AWS
-// credential chain and has no key to fetch.
-const PROVIDER_KEY_PARAM_ENV: Record<string, string> = {
-  mistral: "MISTRAL_API_KEY_PARAM",
-  greenpt: "GREENPT_API_KEY_PARAM",
-};
 
 interface Secrets {
   fastmailToken: string;
   pushoverToken: string;
   pushoverUser: string;
-  // The active provider's API key -- only fetched (see loadSecrets()) when
-  // MODEL_PROVIDER names one that needs a key. A Bedrock-mode deploy has no
-  // dependency on any provider SSM parameter existing at all, which is what
-  // keeps the provider genuinely switchable. One field rather than one per
-  // provider: exactly one provider is active per deploy.
-  providerApiKey?: string;
+  greenptApiKey: string;
 }
 
 // Cached across warm invocations of the same container -- one SSM call per
@@ -57,12 +37,10 @@ interface LivePrompt {
   text: string;
 }
 
-// Cached across warm invocations, same pattern as secretsPromise -- one S3
-// round trip per cold start, not per invocation. Unlike the old fail-open
-// version, a failed fetch here is fatal (no bundled prompt.ts to fall back
-// to) -- handler() clears this cache on failure the same way it already
-// does for secretsPromise, so the next invocation retries S3 instead of
-// failing forever on a stale rejected promise.
+// Same caching pattern as secretsPromise. Unlike a fail-open version, a
+// failed fetch here is fatal -- handler() clears this cache on failure the
+// same way it does for secretsPromise, so the next invocation retries S3
+// instead of failing forever on a stale rejected promise.
 let promptPromise: Promise<LivePrompt> | undefined;
 
 async function loadPrompt(): Promise<LivePrompt> {
@@ -77,51 +55,36 @@ function requireEnv(name: string): string {
 }
 
 async function loadSecrets(): Promise<Secrets> {
-  const fastmailTokenParam = requireEnv("FASTMAIL_TOKEN_PARAM");
-  const pushoverTokenParam = requireEnv("PUSHOVER_TOKEN_PARAM");
-  const pushoverUserParam = requireEnv("PUSHOVER_USER_PARAM");
-  // Only requested for a provider that actually needs a key -- a Bedrock-mode
-  // deploy never touches these param names, so they don't need to exist in
-  // SSM at all until someone switches the provider.
-  const providerKeyParamEnv = PROVIDER_KEY_PARAM_ENV[process.env.MODEL_PROVIDER ?? "bedrock"];
-  const providerApiKeyParam = providerKeyParamEnv ? requireEnv(providerKeyParamEnv) : undefined;
-
-  const names = [fastmailTokenParam, pushoverTokenParam, pushoverUserParam];
-  if (providerApiKeyParam) names.push(providerApiKeyParam);
+  const params = {
+    fastmailToken: requireEnv("FASTMAIL_TOKEN_PARAM"),
+    pushoverToken: requireEnv("PUSHOVER_TOKEN_PARAM"),
+    pushoverUser: requireEnv("PUSHOVER_USER_PARAM"),
+    greenptApiKey: requireEnv("GREENPT_API_KEY_PARAM"),
+  };
 
   const ssm = new SSMClient({});
-  const response = await ssm.send(new GetParametersCommand({ Names: names, WithDecryption: true }));
+  const response = await ssm.send(
+    new GetParametersCommand({ Names: Object.values(params), WithDecryption: true })
+  );
 
   if (response.InvalidParameters && response.InvalidParameters.length > 0) {
     throw new Error(`SSM parameters not found: ${response.InvalidParameters.join(", ")}`);
   }
 
   const byName = new Map((response.Parameters ?? []).map((p) => [p.Name, p.Value]));
-  const fastmailToken = byName.get(fastmailTokenParam);
-  const pushoverToken = byName.get(pushoverTokenParam);
-  const pushoverUser = byName.get(pushoverUserParam);
-  if (!fastmailToken || !pushoverToken || !pushoverUser) {
-    throw new Error("One or more SSM parameters returned an empty value");
-  }
-  const providerApiKey = providerApiKeyParam ? byName.get(providerApiKeyParam) : undefined;
-  if (providerApiKeyParam && !providerApiKey) {
-    throw new Error(`${providerKeyParamEnv} SSM parameter returned an empty value`);
-  }
+  const secrets = Object.fromEntries(
+    Object.entries(params).map(([field, name]) => {
+      const value = byName.get(name);
+      if (!value) throw new Error(`SSM parameter ${name} returned an empty value`);
+      return [field, value];
+    })
+  ) as unknown as Secrets;
 
-  return { fastmailToken, pushoverToken, pushoverUser, providerApiKey };
+  return secrets;
 }
 
 function loadModelConfig(secrets: Secrets): ClassifierConfig {
-  const provider = process.env.MODEL_PROVIDER ?? "bedrock";
-  // apiKey is guaranteed by loadSecrets() for any provider listed in
-  // PROVIDER_KEY_PARAM_ENV -- it throws rather than returning an empty one.
-  if (provider === "mistral") {
-    return { provider: "mistral", apiKey: secrets.providerApiKey!, modelId: requireEnv("MISTRAL_MODEL_ID") };
-  }
-  if (provider === "greenpt") {
-    return { provider: "greenpt", apiKey: secrets.providerApiKey!, modelId: requireEnv("GREENPT_MODEL_ID") };
-  }
-  return { provider: "bedrock", client: new BedrockRuntimeClient({ region: BEDROCK_REGION }), modelId: requireEnv("BEDROCK_MODEL_ID") };
+  return { apiKey: secrets.greenptApiKey, modelId: requireEnv("GREENPT_MODEL_ID") };
 }
 
 // event.dryRun overrides the default apply:true/notify:true production

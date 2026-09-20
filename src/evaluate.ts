@@ -10,7 +10,7 @@
 import { requireFastmailToken, requireModelConfig } from "./config.js";
 import { getCurrentPrompt } from "./current-prompt.js";
 import { getVersionHistory } from "./history.js";
-import { classifyBatch } from "./classify.js";
+import { classifyEmail } from "./classify.js";
 import { runPaced } from "./model-pacing.js";
 import { fetchEmailsByIds } from "./fetch-emails.js";
 import { bootstrapSession } from "./jmap-session.js";
@@ -31,12 +31,8 @@ export const COUNTERWEIGHT_PER_CATEGORY = 6;
 // under the 240s budget. One category alone never had that problem; the
 // sweep's cost was always "N x 5", not "N".
 const COUNTERWEIGHT_SINGLE_CATEGORY = 20;
-// Concurrency and pacing come from model-pacing.ts's runPaced() -- keyed
-// off the model's own rate-limit tier, so a slow-tier model (where the
-// quota itself is the bottleneck, and concurrency measured out as pure
-// throttling risk with no throughput gain) stays sequential automatically,
-// while a fast-tier model where the quota measurably isn't the bottleneck
-// gets a real worker pool.
+// Concurrency and pacing come from model-pacing.ts's runPaced(), measured
+// against the live provider -- see DECISIONS.md.
 
 // The exact trailing instruction the live prompt ends with. A candidate
 // that drops or rewords this breaks classify.ts's
@@ -256,13 +252,10 @@ async function replay(
   const emails = await fetchEmailsByIds(session, idsToFetch);
   const emailById = new Map(emails.map((e) => [e.id, e]));
 
-  // classify.ts's CLASSIFY_BATCH_SIZE=1 (one email per classify call) still
-  // holds -- a replay is only meaningful if it reflects what actually gets
-  // asked of the model at runtime. Provider (Bedrock or Mistral) comes from
-  // `model`, same MODEL_PROVIDER config production classifies with -- this
-  // replay stays honest about what's actually live instead of silently
-  // testing against a different provider forever.
-  const correctionResults = await runPaced(openCorrections, model.provider, model.modelId, async (correction): Promise<CorrectionResult | null> => {
+  // One email per classify call, same as production -- a replay is only
+  // meaningful if it reflects what actually gets asked of the model at
+  // runtime, against the same model id production classifies with.
+  const correctionResults = await runPaced(openCorrections, model.modelId, async (correction): Promise<CorrectionResult | null> => {
     const email = emailById.get(correction.messageId);
     const actualCategory = actualCategoryFromMismatch(correction);
     // No fetched body, or no resolvable ground truth to check against --
@@ -271,7 +264,7 @@ async function replay(
     // corrections list.
     if (!email || actualCategory === null) return null;
 
-    const [outcome] = await classifyBatch(model, [email], candidatePrompt);
+    const outcome = await classifyEmail(model, email, candidatePrompt);
     if ("error" in outcome) {
       return {
         id: correction.messageId,
@@ -294,11 +287,11 @@ async function replay(
   });
   const corrections = correctionResults.filter(isCorrectionResult);
 
-  const counterweightResults = await runPaced(counterweight, model.provider, model.modelId, async (cw): Promise<CorrectionResult | null> => {
+  const counterweightResults = await runPaced(counterweight, model.modelId, async (cw): Promise<CorrectionResult | null> => {
     const email = emailById.get(cw.id);
     if (!email) return null;
 
-    const [outcome] = await classifyBatch(model, [email], candidatePrompt);
+    const outcome = await classifyEmail(model, email, candidatePrompt);
     if ("error" in outcome) {
       // Can't verify this guard still holds -- conservatively flag it
       // rather than silently drop it.

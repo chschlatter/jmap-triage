@@ -3,8 +3,8 @@
 ## triage.ts
 
 Polls `Inbox/Triage` (populated by a separate, already-configured Sieve
-catch-all rule), classifies each message one at a time with an LLM (Bedrock
-or Mistral, chosen by `MODEL_PROVIDER` -- see `ARCHITECTURE.md`) into one of
+catch-all rule), classifies each message one at a time with an LLM
+(GreenPT -- see `ARCHITECTURE.md`, and `DECISIONS.md` for why) into one of
 5 categories (`inbox`, `orders`, `suspicious`, `newsletters`, `noise`), then
 acts on the classification and notifies about it. Category decides where a
 message is filed; a separate `notify` boolean from the same model call
@@ -47,7 +47,7 @@ Logic lives in `src/`, split by pipeline stage (`fetch-emails.ts`,
 `triage.ts` itself is just the CLI entrypoint. The classification prompt
 itself is not bundled in this repo at all — it describes a specific real
 person, so a git-committable copy would have to be either generic-and-wrong
-or PII-bearing-and-uncommittable. It lives only in S3 (`current.json` /
+or PII-bearing-and-uncommittable (`DECISIONS.md`). It lives only in S3 (`current.json` /
 `history/*`, see `current-prompt.ts`), fetched live by every path (CLI,
 eval, Lambda, jmap-triage-mcp) and changed only through the review pipeline
 (`evaluate_candidate` / `approve_prompt_diff`), never edited as a local file.
@@ -57,31 +57,16 @@ eval, Lambda, jmap-triage-mcp) and changed only through the review pipeline
 1. A Fastmail API token — **read/write Mail scope**, since `--apply` moves
    mail between mailboxes. Go to
    https://app.fastmail.com/settings/security/tokens and create one.
-2. A classifier backend — `MODEL_PROVIDER` picks which (default `bedrock`
-   when unset):
-   - **Bedrock**: AWS credentials with `bedrock:InvokeModel` permission for
-     `eu-central-1`, via the standard AWS SDK credential chain (environment
-     variables, `~/.aws/credentials`, SSO, etc -- not read from `.env`), plus
-     a model ID (`BEDROCK_MODEL_ID`), looked up rather than hardcoded
-     (Bedrock model IDs and availability change over time):
-     ```sh
-     aws bedrock list-foundation-models --region eu-central-1 \
-       --query "modelSummaries[].modelId"
-     ```
-     If that ID isn't directly invokable in the region, also check for a
-     cross-region inference profile:
-     ```sh
-     aws bedrock list-inference-profiles --region eu-central-1 \
-       --query "inferenceProfileSummaries[].inferenceProfileId"
-     ```
-   - **Mistral**: an API key from https://console.mistral.ai/
-     (`MISTRAL_API_KEY`) and a model id (`MISTRAL_MODEL_ID`) -- not every
-     model name Mistral documents is available on every account's tier,
-     verify with a direct API call before picking one.
-
-   Whichever model you pick, `src/model-pacing.ts` needs its rate-limit
-   entry added to stay correctly paced -- see that file's comment for how to
-   measure it, not guess it.
+2. A GreenPT API key (`GREENPT_API_KEY`) from https://greenpt.com — an
+   API-only account has no monthly fee and bills per token — plus a model id
+   (`GREENPT_MODEL_ID`). Verify the id against the provider rather than the
+   docs, since a plan restriction can hide a model your key cannot invoke:
+   ```sh
+   curl https://api.greenpt.ai/v1/models -H "Authorization: Bearer $GREENPT_API_KEY"
+   ```
+   Whichever model you pick, `src/model-pacing.ts` needs its entry added to
+   stay correctly paced — see `DECISIONS.md` for how the current numbers were
+   measured, rather than guessing new ones.
 3. The S3 bucket holding the live classification prompt (`PROMPT_BUCKET`)
    -- see "jmap-triage-mcp deployment" below for bootstrapping it, and
    `ARCHITECTURE.md` for why the prompt isn't bundled in this repo.
@@ -98,7 +83,7 @@ eval, Lambda, jmap-triage-mcp) and changed only through the review pipeline
 
 ```sh
 cp .env.example .env   # paste FASTMAIL_TOKEN, PROMPT_BUCKET, PUSHOVER_TOKEN, PUSHOVER_USER,
-                        # and BEDROCK_MODEL_ID or MISTRAL_API_KEY/MISTRAL_MODEL_ID
+                        # GREENPT_API_KEY and GREENPT_MODEL_ID
 npx tsx triage.ts                        # dry run: classify + print planned moves, write nothing
 npx tsx triage.ts --limit=50              # dry run against up to 50 messages
 npx tsx triage.ts --apply                 # classify, move mail, and notify
@@ -119,9 +104,8 @@ npm run eval          # or: npx tsx eval/run-eval.ts
 ```
 
 Runs a fixed set of synthetic sample emails (`eval/golden-set.ts`) through
-`classifyBatch()` against whichever provider `MODEL_PROVIDER` selects
-(Bedrock or Mistral), one at a time (matching production's
-`CLASSIFY_BATCH_SIZE=1`), and reports any category or notify mismatch
+`classifyEmail()`, one at a time exactly as production does, and reports any
+category or notify mismatch
 against the currently live prompt (fetched from S3 -- needs `PROMPT_BUCKET`
 and S3 read access, same as jmap-triage-mcp). It's isolated to the classify
 stage on purpose -- no JMAP session, no mailboxes, no moves, no Pushover.
@@ -163,8 +147,7 @@ and Fastmail/Pushover credentials.
    aws ssm put-parameter --name /jmap-triage/fastmail-token --type SecureString --value "fmu1-..."
    aws ssm put-parameter --name /jmap-triage/pushover-token --type SecureString --value "..."
    aws ssm put-parameter --name /jmap-triage/pushover-user  --type SecureString --value "..."
-   # Only if ModelProvider=mistral:
-   aws ssm put-parameter --name /jmap-triage/mistral-api-key --type SecureString --value "..."
+   aws ssm put-parameter --name /jmap-triage/greenpt-api-key --type SecureString --value "..."
    ```
 2. **Build and deploy**, `ScheduleEnabled` left at its default `false` so
    nothing runs unattended yet:
@@ -173,7 +156,7 @@ and Fastmail/Pushover credentials.
    sam deploy --guided --region eu-central-1
    ```
    `--guided` prompts for the stack name and the template's parameters
-   (`BedrockModelId`, the six mailbox ids, etc.) and saves the answers to
+   (`GreenptModelId`, the six mailbox ids, etc.) and saves the answers to
    `samconfig.toml` for future plain `sam deploy` runs.
 3. **Dry-run the deployed function** before trusting it with real mail —
    `dryRun: true` maps to the same no-writes behavior as the CLI's default

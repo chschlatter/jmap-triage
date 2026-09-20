@@ -35,9 +35,8 @@ sixth destination.
    body text (plain, or HTML converted to plain via `html-to-text`) and
    attachment file names (metadata only — content is never fetched), not
    just a preview snippet.
-2. **Classify** (`classify.ts`) — one model call per email
-   (`CLASSIFY_BATCH_SIZE = 1`), returning `{category, notify}`. See
-   "Classification" below for the two-provider design.
+2. **Classify** (`classify.ts`) — one model call per email, returning
+   `{category, notify}`. See "Classification" below.
 3. **Act** (`actions.ts`) — `planActions` maps each classification to a
    destination mailbox + `$ai-<promptVersion>-<category>` keyword (pure
    function, no I/O); `applyMoves` performs the JMAP `Email/set` writes,
@@ -62,45 +61,39 @@ but skips Pushover.
 
 ## Classification
 
-`classify.ts` exports a `ClassifierConfig` discriminated union
-(`{provider: "bedrock", client, modelId}` or
-`{provider: "mistral", apiKey, modelId}`) and one `classifyBatch(config,
-emails, promptText)` entrypoint that dispatches to the right provider.
-`config.ts`'s `requireModelConfig()` builds this from `MODEL_PROVIDER`
-(default `"bedrock"`), keeping the provider genuinely switchable — a
-rollback is a config change, not a code change.
+`classify.ts` exports a `ClassifierConfig` (`{apiKey, modelId}`) and one
+`classifyEmail(config, email, promptText)` entrypoint, calling GreenPT
+(`api.greenpt.ai`) — a plain OpenAI chat-completions API, reached with
+`fetch`, no SDK. `config.ts`'s `requireModelConfig()` builds the config from
+`GREENPT_API_KEY`/`GREENPT_MODEL_ID`.
 
-- **Bedrock**: `BedrockRuntimeClient` + `ConverseCommand` (model-agnostic,
-  not Anthropic-specific — any Bedrock model authorizes on the same
-  `bedrock:InvokeModel` action).
-- **Mistral**: `fetch` directly against `api.mistral.ai`'s chat completions
-  endpoint — not through Bedrock. Not every model name Mistral documents is
-  available on every account's subscription tier; verify with a direct API
-  call before picking `MISTRAL_MODEL_ID`.
+The wire format is an array in and an array out — the prompt describes a JSON
+array of emails — so a one-email call sends an array of one and matches the
+reply on `id`. See `DECISIONS.md` for why GreenPT, why one email per call, and
+what the rollback path is.
 
-Both retry with exponential backoff on throttling. Response parsing is
-shared (`parseClassificationResponse`): the model is asked to reply with
-only a JSON array, but in practice sometimes wraps it in a code fence or
-appends trailing prose, so `extractJsonArray` scans for the first balanced
-top-level `[...]` instead of assuming the whole response is bare JSON.
-`notify` is fail-closed — missing or non-boolean coerces to `false` rather
-than erroring the whole email out.
+Retries use exponential backoff on 429, but a billing failure (402, or a
+gateway signalling an empty balance as 429 `insufficient_quota`) is terminal
+and surfaced immediately rather than burning the backoff ladder. The model is
+asked to reply with only a JSON array, but in practice sometimes wraps it in a
+code fence or appends trailing prose, so `extractJsonArray` scans for the first
+balanced top-level `[...]` instead of assuming the whole response is bare JSON.
+`notify` is fail-closed — missing or non-boolean coerces to `false` rather than
+erroring the whole email out.
 
-**Pacing** (`model-pacing.ts`) is a per-provider, per-model table of
-concurrency and inter-call delay, measured empirically against this
-account's actual rate limits (not vendor-documented numbers) — Bedrock
-on-demand models get a fast tier (high concurrency, short delay), Bedrock
-cross-region-inference-profile models and Mistral both get a slow,
-sequential tier since the quota itself is the bottleneck there, not call
-latency. A burst cooldown (`MAX_BURST_CALLS`/`BURST_COOLDOWN_MS`) caps how
-long a fast-tier run can sustain its full concurrency before pausing, since
-burst testing only ever validated a few seconds at a time.
+**Pacing** (`model-pacing.ts`) is a per-model table of inter-call delay plus a
+fixed concurrency, measured empirically against the provider (GreenPT
+publishes no rate limits and returns no `x-ratelimit-*` headers) rather than
+taken from vendor docs. A burst cooldown (`MAX_BURST_CALLS`/
+`BURST_COOLDOWN_MS`) caps how long a run can sustain full concurrency before
+pausing, since probing only ever validated a few seconds at a time. The
+measurements are in `DECISIONS.md`.
 
 ## Prompt: no bundled file, S3 is the source of truth
 
 There is no `prompt.ts` in this repo. The classification prompt describes a
 specific real person, so a git-committable copy would have to be either
-generic-and-wrong or PII-bearing-and-uncommittable. Instead:
+generic-and-wrong or PII-bearing-and-uncommittable (`DECISIONS.md`). Instead:
 
 - `current.json` (S3) holds `{version, prompt}` — the live pointer every
   classify call fetches (`current-prompt.ts`).
@@ -172,8 +165,7 @@ AWS SAM (`template.yaml`), two Lambda functions in one stack:
   builder, since the Lambda Web Adapter's zip-package convention needs a
   `run.sh` startup script alongside the bundle.
 
-**Secrets** (Fastmail token, Pushover token/user, Mistral API key when
-`MODEL_PROVIDER=mistral`) live in SSM Parameter Store `SecureString`s,
+**Secrets** (Fastmail token, Pushover token/user, GreenPT API key) live in SSM Parameter Store `SecureString`s,
 created out of band (`aws ssm put-parameter`), never in a CloudFormation
 parameter or the deploy command line. `TriageFunction` fetches them once
 per cold start and caches across warm invocations, threaded through
@@ -184,8 +176,8 @@ requests per container, and the modules it wraps (`config.ts`'s
 `requireFastmailToken()`/`requireModelConfig()`) already read plain
 `process.env` uniformly for every other caller (CLI, eval).
 
-**Non-secret config** (`BEDROCK_MODEL_ID`, `MODEL_PROVIDER`,
-`MISTRAL_MODEL_ID`, the six mailbox id overrides, `LIMIT`) is a plain
+**Non-secret config** (`GREENPT_MODEL_ID`, the six mailbox id overrides,
+`LIMIT`) is a plain
 Lambda env var. Every mailbox the pipeline touches is described once in
 `MAILBOX_SPECS` (`mailboxes.ts`) — `config.ts`'s override reading and
 `actions.ts`'s category→destination mapping both derive from this table
@@ -196,7 +188,7 @@ missing, before a single classify call is spent.
 **No VPC, no reserved concurrency.** The pipeline is stateless between
 runs — nothing to persist, nothing a cold start needs to rehydrate — so no
 VPC is needed for either function, and Lambda's default networking already
-has outbound internet for Fastmail, Bedrock, and Mistral's APIs alike.
+has outbound internet for Fastmail's and GreenPT's APIs alike.
 `ReservedConcurrentExecutions` isn't set: this account's Lambda concurrency
 floor (10 unreserved, account-wide) rejects reserving even 1. In practice,
 overlap between two scheduled invocations would require a run slow enough
@@ -214,8 +206,8 @@ src/
   jmap-session.ts           -- Session type, bootstrapSession, jmapRequest
   mailboxes.ts              -- MAILBOX_SPECS (single source of truth), resolveMailboxes
   fetch-emails.ts           -- fetchTriageEmails, extractBodyText, extractAttachmentNames
-  classify.ts               -- ClassifierConfig, classifyBatch (Bedrock + Mistral)
-  model-pacing.ts           -- per-provider/model concurrency + delay, runPaced()
+  classify.ts               -- ClassifierConfig, classifyEmail (GreenPT)
+  model-pacing.ts           -- per-model concurrency + delay, runPaced()
   actions.ts                -- destinationsFor, planActions, applyMoves, keyword helpers
   notify.ts                 -- buildFastmailUrl, sendPushoverNotification
   main.ts                   -- runPipeline (reusable pipeline body) + main (CLI shell)
