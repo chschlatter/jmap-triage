@@ -6,23 +6,19 @@ import type { TriageEmail } from "./fetch-emails.js";
 
 const PUSHOVER_URL = "https://api.pushover.net/1/messages.json";
 
-// A single notify tier, driven entirely by the model's own `notify` field
-// (see classify.ts) -- not by category. There is deliberately no category
-// gate here: the prompt's NOTIFY rules are what keep e.g. suspicious mail
-// from pushing, not this code.
+// One notify tier, driven entirely by the model's `notify` field. No category
+// gate here by design -- the prompt's NOTIFY rules are what keep e.g.
+// suspicious mail from pushing.
 const PUSHOVER_PRIORITY = 0;
 
-// Deep link uses the destination mailbox's full path and the bare emailId
-// -- verified live against a real nested mailbox
-// (https://app.fastmail.com/mail/Inbox/Triage/StnVqnj87Erc uses the full
-// "Inbox/Triage" path, not a leaf name).
+// Deep link takes the destination's full path plus the bare emailId -- a
+// nested mailbox uses "Inbox/Triage", not the leaf name (verified live).
 function buildFastmailUrl(email: TriageEmail, destination: Destination): string {
   return `https://app.fastmail.com/mail/${destination.path}/${email.id}`;
 }
 
-// Non-fatal by design: a Pushover failure is logged by the caller and the
-// run continues -- notification delivery isn't critical enough to abort a
-// run that already committed real mailbox moves.
+// The caller logs failures and continues: delivery isn't critical enough to
+// abort a run that already committed real mailbox moves.
 export async function sendPushoverNotification(
   config: PushoverConfig,
   email: TriageEmail,

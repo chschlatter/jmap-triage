@@ -1,10 +1,7 @@
-// Resolves the mailboxes the action stage moves mail between. Every
-// mailbox is described once, in MAILBOX_SPECS below -- config.ts's
-// override reading and actions.ts's category->destination mapping both
-// derive from this same table instead of each keeping their own
-// hand-synced copy, so adding a category means adding one row here, not
-// editing multiple files in lockstep with nothing enforcing they stay in
-// sync.
+// Resolves the mailboxes the action stage moves mail between. MAILBOX_SPECS
+// below is the single source of truth: config.ts's override reading and
+// actions.ts's category->destination map both derive from it, so adding a
+// category is one row here rather than edits in lockstep across files.
 
 import { CORE, MAIL, jmapRequest, type Session } from "./jmap-session.js";
 
@@ -13,8 +10,7 @@ interface MailboxSpec {
   // Full path from the account root, e.g. ["Inbox", "Orders"].
   path: readonly string[];
   envVar: string;
-  // Present only for mailboxes a classification category moves mail
-  // into -- Inbox/Triage (the source, not a destination) omits it.
+  // Only set for destinations -- Inbox/Triage is the source, so it omits it.
   category?: string;
 }
 
@@ -36,10 +32,8 @@ export type MailboxKey = (typeof MAILBOX_SPECS)[number]["key"];
 export type MailboxRefs = Record<MailboxKey, string>;
 export type MailboxOverrides = Partial<Record<MailboxKey, string>>;
 
-// JMAP role for each top-level name a spec's path can start with -- role is
-// the part of RFC 8621 actually guaranteed unique and stable, unlike a
-// display-name match, which is incidental and would break under a renamed
-// or localized mailbox.
+// Match top-level mailboxes by RFC 8621 role, not display name: role is the
+// part guaranteed unique and stable under a rename or localized UI.
 const TOP_LEVEL_ROLES: Record<string, string> = { Inbox: "inbox", Archive: "archive" };
 
 function actionableMissingMailboxError(name: string, parentLabel: string, envVar: string): Error {
@@ -91,11 +85,9 @@ async function resolveChildMailbox(
   return ids[0];
 }
 
-// Resolves one spec's full path, reusing an already-resolved (or
-// in-flight) top-level lookup across specs that share a root -- e.g. the
-// four Inbox-rooted destination specs plus Inbox/Triage hit Mailbox/query
-// for "Inbox" itself only once between them, keyed by whichever spec's
-// envVar got there first.
+// Resolves one spec's full path, sharing the in-flight top-level lookup
+// across specs with the same root -- the five Inbox-rooted specs query for
+// "Inbox" itself once between them.
 async function resolvePath(
   session: Session,
   path: readonly string[],
@@ -117,10 +109,8 @@ async function resolvePath(
   return id;
 }
 
-// Resolves every mailbox in MAILBOX_SPECS for one run. A missing mailbox
-// fails the whole run (not just moves for the affected category) --
-// resolution happens before any fetching or classifying, so a missing
-// destination is caught before spending a single classify call.
+// A missing mailbox fails the whole run, not just its category: resolution
+// runs before any fetch or classify, so it costs no model calls.
 export async function resolveMailboxes(session: Session, overrides: MailboxOverrides): Promise<MailboxRefs> {
   const topLevelCache = new Map<string, Promise<string>>();
   const refs = {} as Record<MailboxKey, string>;

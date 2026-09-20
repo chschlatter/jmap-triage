@@ -1,11 +1,5 @@
-// .env loading, CLI flag parsing, and env-var validation. Kept separate from
-// the modules that consume the values so a new required env var or flag
-// touches one file, not the orchestration logic in main.ts.
-//
-// Error messages here name the missing variable and point at README.md's
-// Configuration section rather than inlining setup instructions -- they fire
-// for one operator on a machine that either has a working .env or needs the
-// README anyway.
+// .env loading, CLI flag parsing, env-var validation. Separate from the
+// modules that consume the values, so a new env var or flag touches one file.
 
 import { MAILBOX_SPECS, type MailboxOverrides } from "./mailboxes.js";
 import type { ClassifierConfig } from "./classify.js";
@@ -40,9 +34,7 @@ function parseLimit(argv: string[]): number {
   return n;
 }
 
-// --apply: perform real moves + notifications. Default is dry run -- print
-// what would happen, write nothing. --no-notify (only meaningful with
-// --apply): perform moves, skip Pushover.
+// Default is dry run; --no-notify is only meaningful with --apply.
 export function parseArgs(argv: string[]): CliOptions {
   const apply = argv.includes("--apply");
   const notify = apply && !argv.includes("--no-notify");
@@ -52,7 +44,7 @@ export function parseArgs(argv: string[]): CliOptions {
 function requireEnv(name: string, purpose: string): string {
   const value = process.env[name];
   if (!value) {
-    throw new Error(`${name} is not set (${purpose}). See README.md, Configuration.`);
+    throw new Error(`${name} is not set (${purpose}). See README.md, Prerequisites.`);
   }
   return value;
 }
@@ -61,16 +53,14 @@ export function requireFastmailToken(): string {
   return requireEnv("FASTMAIL_TOKEN", "Fastmail API token, Mail read/write scope");
 }
 
-// Used by every non-Lambda caller (CLI main(), evaluate.ts inside
-// McpServerFunction). lambda.ts does NOT use this: TriageFunction threads its
-// secrets through explicitly rather than mutating process.env, so it builds
-// its ClassifierConfig inline instead.
+// Every non-Lambda caller (CLI main(), evaluate.ts). lambda.ts builds its
+// ClassifierConfig inline instead -- it threads secrets through explicitly
+// rather than mutating process.env.
 export function requireModelConfig(): ClassifierConfig {
   return {
     apiKey: requireEnv("GREENPT_API_KEY", "GreenPT API key, greenpt.com"),
-    // Verify a new id against GET https://api.greenpt.ai/v1/models before
-    // setting it -- a plan restriction can hide a model the key cannot
-    // invoke (DECISIONS.md, 2026-09-06).
+    // Verify a new id against GET /v1/models first -- a plan restriction can
+    // hide a model the key cannot invoke (DECISIONS.md).
     modelId: requireEnv("GREENPT_MODEL_ID", "GreenPT model id, e.g. glm-5.3-flash"),
   };
 }
@@ -87,21 +77,16 @@ export function requirePushoverConfig(): PushoverConfig {
   };
 }
 
-// S3 bucket holding current.json / history/* -- see ARCHITECTURE.md. Read by
-// every classify-path caller's live prompt fetch (current-prompt.ts) and by
-// every jmap-triage-mcp tool. One bucket, one env var name, shared by both
-// deployables -- see template.yaml.
+// One bucket, shared by both deployables: every classify path's live prompt
+// fetch and every MCP tool read/write it. See ARCHITECTURE.md.
 export function requirePromptBucket(): string {
   return requireEnv("PROMPT_BUCKET", "S3 bucket holding current.json and history/*");
 }
 
 export type { MailboxOverrides };
 
-// Each override skips one Mailbox/query lookup and uses the given id
-// directly -- ids are stable across runs, which is what lets the Lambda
-// deployment set all six and skip every lookup. Reads generically off
-// MAILBOX_SPECS (mailboxes.ts) instead of a hand-written field per mailbox,
-// so a new mailbox spec doesn't need a matching edit here.
+// Each override skips one Mailbox/query lookup. Read off MAILBOX_SPECS rather
+// than a field per mailbox, so a new spec needs no edit here.
 export function readMailboxOverrides(): MailboxOverrides {
   const overrides: MailboxOverrides = {};
   for (const spec of MAILBOX_SPECS) {

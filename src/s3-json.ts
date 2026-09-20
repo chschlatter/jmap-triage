@@ -1,18 +1,13 @@
-// Tiny shared S3 get/put-JSON helper. Every jmap-triage-mcp module that
-// touches S3 (current-prompt.ts, history.ts, approve.ts) reads or writes a
-// plain JSON object at one key -- this is the one place that owns the
-// S3Client and the JSON.parse/stringify boilerplate, so those modules stay
-// about their own record shape, not about S3.
+// Shared S3 get/put-JSON helper: owns the S3Client and the parse/stringify
+// boilerplate, so current-prompt.ts, history.ts and approve.ts stay about
+// their own record shapes.
 
 import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 
-// Explicit region, not S3Client({}) -- PromptStoreBucket lives in
-// eu-central-1 regardless of caller (same region every other AWS call in
-// this repo targets). Inside Lambda this doesn't matter (AWS_REGION is set
-// automatically), but a bare S3Client({}) falls back to the SDK's default
-// region resolution chain (~/.aws/config, AWS_REGION, etc.) for the CLI/
-// eval path, which errors with IllegalLocationConstraintException the
-// moment that resolves to anything other than eu-central-1.
+// Explicit region, not S3Client({}): the bucket is in eu-central-1 regardless
+// of caller. Lambda sets AWS_REGION itself, but on the CLI/eval path the
+// SDK's resolution chain (~/.aws/config, ...) errors with
+// IllegalLocationConstraintException the moment it resolves elsewhere.
 const S3_REGION = "eu-central-1";
 const s3 = new S3Client({ region: S3_REGION });
 

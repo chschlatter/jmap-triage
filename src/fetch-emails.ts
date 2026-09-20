@@ -1,17 +1,14 @@
-// Fetches classification input from Inbox/Triage. Also fetches the JMAP
-// `preview` property -- used for Pushover notification bodies, not for
-// classification itself.
+// Fetches classification input from Inbox/Triage. `preview` is fetched for
+// Pushover notification bodies, not for classification.
 
 import { convert as htmlToText } from "html-to-text";
 import { CORE, MAIL, jmapRequest, type Session } from "./jmap-session.js";
 
-// Server-side cap on each body part's returned text (JMAP truncates on a
-// valid UTF-8 boundary, so this is applied in the Email/get request itself
-// rather than sliced client-side after a full fetch).
+// Server-side cap, passed to Email/get rather than sliced client-side: JMAP
+// truncates on a valid UTF-8 boundary.
 const MAX_BODY_VALUE_BYTES = 4000;
-// Defends against a pathological attachments list (e.g. a newsletter with
-// dozens of inline images all marked as attachments) eating into the token
-// budget for no classification benefit.
+// Keeps a pathological attachment list (a newsletter with dozens of inline
+// images) from eating the token budget for no classification benefit.
 const MAX_ATTACHMENTS = 10;
 
 export interface TriageEmail {
@@ -34,11 +31,9 @@ function withTruncationMarker(text: string, isTruncated: boolean | undefined): s
   return isTruncated ? `${text}\n...[truncated]` : text;
 }
 
-// Prefers a genuine text/plain part; falls back to converting text/html to
-// plain text (many transactional/marketing mail is HTML-only). Per RFC 8621
-// SS4.1.4, when a message has no text/plain part, servers may return the
-// text/html part itself inside `textBody` -- so a part in `textBody` isn't
-// necessarily text/plain, and `type` has to be checked either way.
+// Prefers a real text/plain part, else converts text/html (most marketing
+// mail is HTML-only). Per RFC 8621 SS4.1.4 a server may put the text/html
+// part inside `textBody`, so `type` has to be checked either way.
 function extractBodyText(m: any): string {
   const bodyValues: Record<string, { value: string; isTruncated?: boolean }> = m.bodyValues ?? {};
   const textParts: Array<{ partId: string; type: string }> = m.textBody ?? [];
@@ -59,9 +54,8 @@ function extractBodyText(m: any): string {
   return withTruncationMarker(htmlToText(bv.value, { wordwrap: false }), bv.isTruncated);
 }
 
-// Drops inline/CID assets (signature logos, tracking-pixel-adjacent images)
-// that aren't attachments a human would recognize as such, and caps the
-// count so one pathological email can't eat the token budget.
+// Drops inline/CID assets (signature logos, tracking pixels) -- not
+// attachments a human would recognize as such.
 function extractAttachmentNames(m: any): string[] {
   const attachments: Array<{ name?: string | null; disposition?: string | null }> = m.attachments ?? [];
   return attachments
@@ -121,12 +115,9 @@ export async function fetchTriageEmails(session: Session, mailboxId: string, lim
   return (emailGet.list as any[]).map(toTriageEmail);
 }
 
-// Fetches specific messages by id, wherever they currently live -- unlike
-// fetchTriageEmails, not scoped to one mailbox. Used by evaluate.ts to fetch
-// bodies for its live-derived corrections and counterweight sample at eval
-// time. A deleted/inaccessible id is silently absent from the result rather
-// than failing the whole call -- same "isolate one bad row" posture as
-// applyMoves' per-id notUpdated handling (actions.ts).
+// By id, wherever the message currently lives -- evaluate.ts's replay needs
+// bodies from outside Inbox/Triage. A deleted or inaccessible id is simply
+// absent from the result rather than failing the call.
 export async function fetchEmailsByIds(session: Session, ids: string[]): Promise<TriageEmail[]> {
   if (ids.length === 0) return [];
 

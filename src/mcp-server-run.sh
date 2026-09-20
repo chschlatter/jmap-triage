@@ -1,9 +1,7 @@
 #!/bin/bash
-# Startup script for McpServerFunction under the AWS Lambda Web Adapter.
-# Zip-package (non-container) deployments point Handler at a script like
-# this one instead of a normal file.function handler -- the adapter execs
-# it directly (AWS_LAMBDA_EXEC_WRAPPER=/opt/bootstrap, see template.yaml),
-# and it's this script's job to start the actual HTTP server the adapter
-# then proxies traffic to. See the Makefile's build-McpServerFunction target
-# for how this gets into the deployed zip alongside the esbuild bundle.
+# Startup script for McpServerFunction under the AWS Lambda Web Adapter. A
+# zip-package deployment points Handler at a script like this instead of a
+# file.function handler: the adapter execs it directly
+# (AWS_LAMBDA_EXEC_WRAPPER=/opt/bootstrap), and its job is to start the HTTP
+# server the adapter proxies to. The Makefile puts it in the zip.
 exec node mcp-server.js

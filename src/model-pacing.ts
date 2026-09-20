@@ -1,11 +1,10 @@
 // How fast/concurrently the classifier may be called. Every caller (main.ts,
-// evaluate.ts, eval/run-eval.ts) goes through runPaced() instead of its own
-// hand-copied constant, so a model change stays correctly paced everywhere.
+// evaluate.ts, eval/run-eval.ts) goes through runPaced(), so a model change
+// stays correctly paced everywhere.
 //
-// These numbers were measured against GreenPT, not read off vendor docs --
-// GreenPT publishes no rate limits and returns no x-ratelimit-* headers. See
-// DECISIONS.md for the probe results and why concurrency 4 rather than 8.
-// Re-measure before raising either number or trusting them for another model.
+// Measured, not read off vendor docs -- GreenPT publishes no rate limits and
+// returns no x-ratelimit-* headers. Probe results and why concurrency 4 and
+// not 8: DECISIONS.md. Re-measure before raising either number.
 
 const MODEL_DELAY_MS: Record<string, number> = {
   "glm-5.3-flash": 150,
@@ -21,11 +20,10 @@ export function getConcurrency(): number {
   return CONCURRENCY;
 }
 
-// Pause after every MAX_BURST_CALLS completed so a long-running call (a bigger
-// GOLDEN_SET, a larger live counterweight sample) can't quietly run at full
-// concurrency for minutes against limits only ever probed in short bursts.
-// BURST_COOLDOWN_MS is a full rate-limit window (60s) so every call from
-// before the pause has aged out by the time the burst resumes.
+// Keeps a long run (a bigger golden set, a large counterweight sample) from
+// sustaining full concurrency for minutes against limits only ever probed in
+// short bursts. The cooldown is a full 60s window, so every pre-pause call
+// has aged out by the time the burst resumes.
 export const MAX_BURST_CALLS = 100;
 export const BURST_COOLDOWN_MS = 60_000;
 
@@ -33,11 +31,9 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Shared concurrency-limited, burst-capped executor -- used by main.ts's
-// production classify loop, evaluate_candidate's live-mail replay, and
-// eval/run-eval.ts alike. onItemDone fires as each item finishes (out of
-// input order under concurrency > 1) -- use it for progress logging; the
-// returned array stays indexed in input order regardless.
+// onItemDone fires as each item finishes, so out of input order under
+// concurrency > 1 -- it's for progress logging. The returned array stays
+// indexed in input order regardless.
 export async function runPaced<T, R>(
   items: T[],
   modelId: string,

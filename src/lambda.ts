@@ -1,17 +1,12 @@
-// Lambda entrypoint. Assembles the same PipelineConfig the CLI's main()
-// builds from argv/.env, but from Lambda's own config sources instead: the
-// secrets (FASTMAIL_TOKEN, PUSHOVER_TOKEN, PUSHOVER_USER, GREENPT_API_KEY)
-// come from SSM Parameter Store SecureStrings, fetched once per container and
-// cached across warm invocations; everything else (GREENPT_MODEL_ID, the six
-// mailbox id overrides, LIMIT) is a plain Lambda env var.
+// TriageFunction entrypoint. Builds the same PipelineConfig as the CLI's
+// main(), but from Lambda's sources: secrets from SSM SecureStrings,
+// everything else (GREENPT_MODEL_ID, mailbox id overrides, LIMIT) from plain
+// env vars, both fetched once per container.
 //
-// The classification prompt is also fetched once per container and cached the
-// same way, from S3's current.json -- the live pointer jmap-triage-mcp's
-// approve_prompt_diff writes. That is what makes a prompt approval in the
-// review loop actually change what production classifies with. There is no
-// bundled local fallback (DECISIONS.md, "no bundled local prompt"), so a
-// failed S3 fetch is fatal, same as a failed secrets fetch, not a silent
-// degrade.
+// The prompt is cached the same way, from S3's current.json -- the pointer
+// approve_prompt_diff writes, which is what makes a review-loop approval
+// change what production classifies with. A failed fetch is fatal; there is
+// no local fallback (DECISIONS.md).
 
 import { SSMClient, GetParametersCommand } from "@aws-sdk/client-ssm";
 import { readMailboxOverrides, type PushoverConfig } from "./config.js";
@@ -28,8 +23,7 @@ interface Secrets {
   greenptApiKey: string;
 }
 
-// Cached across warm invocations of the same container -- one SSM call per
-// cold start, not per invocation.
+// One SSM call per cold start, not per invocation.
 let secretsPromise: Promise<Secrets> | undefined;
 
 interface LivePrompt {
@@ -37,10 +31,8 @@ interface LivePrompt {
   text: string;
 }
 
-// Same caching pattern as secretsPromise. Unlike a fail-open version, a
-// failed fetch here is fatal -- handler() clears this cache on failure the
-// same way it does for secretsPromise, so the next invocation retries S3
-// instead of failing forever on a stale rejected promise.
+// Same caching pattern as secretsPromise, including handler() clearing it on
+// failure so the next invocation retries instead of failing forever.
 let promptPromise: Promise<LivePrompt> | undefined;
 
 async function loadPrompt(): Promise<LivePrompt> {
@@ -87,9 +79,8 @@ function loadModelConfig(secrets: Secrets): ClassifierConfig {
   return { apiKey: secrets.greenptApiKey, modelId: requireEnv("GREENPT_MODEL_ID") };
 }
 
-// event.dryRun overrides the default apply:true/notify:true production
-// path -- e.g. `aws lambda invoke --payload '{"dryRun": true}'` to validate
-// a deployment against real Inbox/Triage state without moving mail.
+// event.dryRun overrides the default apply:true/notify:true, to validate a
+// deployment against real Inbox/Triage state without moving mail.
 export interface LambdaEvent {
   dryRun?: boolean;
 }
@@ -97,8 +88,7 @@ export interface LambdaEvent {
 export async function handler(event: LambdaEvent | undefined): Promise<void> {
   try {
     secretsPromise ??= loadSecrets();
-    // A failed fetch must not stick around for the next warm invocation --
-    // clear the cache so it retries SSM instead of failing forever.
+    // Don't let a rejected promise stick around for the next invocation.
     const secrets = await secretsPromise.catch((err) => {
       secretsPromise = undefined;
       throw err;
@@ -130,8 +120,8 @@ export async function handler(event: LambdaEvent | undefined): Promise<void> {
       prompt,
     });
   } catch (err) {
-    // Rethrow (not swallow) so the invocation reports as failed -- Lambda's
-    // Errors metric and default async-invoke retry both depend on that.
+    // Rethrow so the invocation reports as failed -- Lambda's Errors metric
+    // and its async-invoke retry both depend on that.
     console.error(err instanceof Error ? err.message : err);
     throw err;
   }

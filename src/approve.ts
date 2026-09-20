@@ -1,13 +1,11 @@
-// approve_prompt_diff (jmap-triage-mcp tool #5) -- the only write path in
-// the entire server. Takes the evaluate_candidate result as input, not
-// re-derived, so a history record can never claim a replay outcome that
-// wasn't actually produced by a real evaluation call. The calling Claude
-// session is responsible for having gotten explicit human approval before
-// calling this at all -- see mcp-server.ts's tool description.
+// approve_prompt_diff -- the only write path in the whole server. Takes the
+// evaluate_candidate result as input rather than re-deriving it, so a history
+// record can never claim a replay outcome no evaluation produced. Getting
+// explicit human approval first is the calling session's responsibility (see
+// mcp-server.ts's tool description).
 //
-// Writes, in order: current.json (the new live pointer), then
-// history/<version>.json (the full immutable record), then
-// history/index.json (append the new version). See ARCHITECTURE.md.
+// Writes in order: current.json, history/<version>.json, then the appended
+// history/index.json.
 
 import { requirePromptBucket } from "./config.js";
 import { getJson, putJson } from "./s3-json.js";
@@ -43,10 +41,9 @@ export async function approvePromptDiff(
 ): Promise<ApprovePromptDiffResult> {
   const bucket = requirePromptBucket();
 
-  // Read the live pointer at write time (not caller-supplied) so
-  // previousVersion in the record reflects what was actually live the
-  // instant this approval landed, not whatever the caller's evaluate_candidate
-  // call saw earlier in the round.
+  // Read at write time, not caller-supplied, so previousVersion reflects what
+  // was live the instant this approval landed -- not what the caller's
+  // evaluate_candidate saw earlier in the round.
   const previous = await getCurrentPrompt().catch(() => null);
 
   const record: VersionRecord = {

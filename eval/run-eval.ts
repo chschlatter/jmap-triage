@@ -1,17 +1,13 @@
-// Classification eval -- NOT part of the deployed pipeline and NOT run in
-// CI. Runs the synthetic fixtures in golden-set.ts through the real
-// classifyEmail() and reports category/notify mismatches against the
-// CURRENTLY LIVE prompt (S3's current.json, fetched via getCurrentPrompt() --
-// there is no bundled local prompt to test against instead, see
-// DECISIONS.md). Isolated to the classify stage on purpose: no
-// JMAP session, no mailboxes, no moves, no Pushover -- it exists to catch
-// a prompt approval that silently breaks a rule the prompt already relies
-// on, quickly and without touching Fastmail. See golden-set.ts for what
-// these fixtures are (and aren't) a substitute for.
+// Classification eval -- not deployed, not in CI. Runs golden-set.ts's
+// synthetic fixtures through the real classifyEmail() against the currently
+// live S3 prompt, and reports category/notify mismatches. Isolated to the
+// classify stage on purpose (no JMAP, no moves, no Pushover): it exists to
+// catch a prompt approval that silently breaks a rule the prompt already
+// relies on, without touching Fastmail. See golden-set.ts for what these
+// fixtures are and aren't a substitute for.
 //
-// Run: npx tsx eval/run-eval.ts
-// Requires PROMPT_BUCKET set (S3 read access) -- same as jmap-triage-mcp.
-// Exits non-zero if any category mismatch is found.
+// Run: npx tsx eval/run-eval.ts -- needs PROMPT_BUCKET and S3 read access.
+// Exits non-zero on any category mismatch.
 
 import { loadEnvFile, requireModelConfig } from "../src/config.js";
 import { classifyEmail, type ClassificationOutcome } from "../src/classify.js";
@@ -61,16 +57,14 @@ async function main() {
   await loadEnvFile();
   const model = requireModelConfig();
   const current = await getCurrentPrompt();
-  // Concurrency, pacing and the burst-cap cooldown all come from
-  // model-pacing.ts's runPaced(), same as production.
+  // Concurrency, pacing and burst cooldown all via runPaced(), as production.
   console.log(
     `Evaluating classify.ts against live prompt ${current.version} ` +
       `(model: ${model.modelId}, concurrency: ${getConcurrency()})`
   );
   console.log(`${GOLDEN_SET.length} case(s)\n`);
 
-  // Progress lines below may print out of GOLDEN_SET order when
-  // concurrency > 1 -- rows[] itself stays correctly indexed regardless.
+  // Progress lines print out of order under concurrency > 1; rows[] doesn't.
   const rows = await runPaced(GOLDEN_SET, model.modelId, async (c) => {
     return buildRow(c, await classifyEmail(model, c, current.prompt));
   }, (row, c, i) => {

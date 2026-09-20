@@ -1,11 +1,8 @@
-// One-off audit script -- not part of the deployed pipeline, and largely
-// superseded by the jmap-triage-mcp get_triage_report tool (dynamic across
-// all prompt versions, not hardcoded to one -- see keyword-scan.ts). Pulls
-// every email since SINCE that carries an $ai-v7-* keyword (i.e. actually
-// went through classify.ts), and reports the AI's category against where
-// the email currently sits, so a Claude+Fastmail-MCP session can spot-check
-// mismatches. There is no bundled prompt.ts to rewrite anymore -- feed
-// mismatches back through evaluate_candidate/approve_prompt_diff instead.
+// One-off audit script, largely superseded by get_triage_report, which scans
+// every prompt version instead of the one hardcoded here. Pulls every email
+// since SINCE carrying an $ai-v7-* keyword and reports the AI's category
+// against where the email currently sits, for spot-checking mismatches. Feed
+// what turns up back through evaluate_candidate/approve_prompt_diff.
 // Read-only: no Email/set calls.
 //
 // Run: FASTMAIL_TOKEN=... npx tsx reports/generate-report.ts
@@ -17,11 +14,9 @@ const SINCE = "2026-08-07T00:00:00Z";
 const CATEGORIES = ["inbox", "orders", "suspicious", "newsletters", "noise"] as const;
 type Category = (typeof CATEGORIES)[number];
 
-// Mirrors destinationsFor in src/actions.ts -- the folder each category
-// should land in immediately after a triage run. v7 collapsed "attention"
-// and "keep" into "inbox" and added "orders" -- see src/mailboxes.ts
-// MAILBOX_SPECS, the single source of truth this table now has to track by
-// hand since this script doesn't import it directly.
+// Hand-synced mirror of MAILBOX_SPECS (src/mailboxes.ts), pinned to v7's
+// vocabulary: it collapsed "attention"/"keep" into "inbox" and added
+// "orders".
 const EXPECTED_PATH: Record<Category, string> = {
   inbox: "Inbox",
   orders: "Inbox/Orders",
@@ -57,10 +52,8 @@ async function main() {
 
   const session = await bootstrapSession(token);
 
-  // Build mailboxId -> full path map for every mailbox in the account, so a
-  // triaged email that got manually moved somewhere outside the five
-  // pipeline folders (plain Archive, Trash, a project folder, ...) still
-  // shows up with a real name instead of a bare id.
+  // Every mailbox in the account, so an email manually filed outside the five
+  // pipeline folders still shows a real name instead of a bare id.
   const mailboxData = await jmapRequest(session, [CORE, MAIL], [
     ["Mailbox/get", { accountId: session.accountId, properties: ["name", "parentId"] }, "a"],
   ]);
@@ -115,10 +108,8 @@ async function main() {
   const rows: ReportRow[] = [];
   for (const m of emails) {
     const keywords: Record<string, boolean> = m.keywords ?? {};
-    // Every category keyword is also matched by /^\$ai-v7-/, but so is the
-    // separate $ai-v7-notified push marker (src/actions.ts aiNotifiedKeyword)
-    // -- an email can carry both. Match against CATEGORIES explicitly so
-    // "notified" never gets mistaken for a category.
+    // /^\$ai-v7-/ also matches the separate $ai-v7-notified push marker, and
+    // an email can carry both -- match CATEGORIES explicitly.
     const category = CATEGORIES.find((c) => keywords[`$ai-v7-${c}`]);
     if (!category) continue; // shouldn't happen given the query filter, but stay defensive
 
@@ -141,14 +132,10 @@ async function main() {
     });
   }
 
-  // Agreement signal: as of v7 every category has its own distinct
-  // destination folder (attention/keep collapsed into inbox -- see
-  // src/actions.ts destinationsFor), so "moved somewhere other than the
-  // expected folder" is a direct disagreement signal for all five, with one
-  // exception: Fastmail's "report phishing" button moves the email straight
-  // to Trash (confirmed by the user 2026-08-18), not Inbox/Suspicious. A
-  // `suspicious` email in Trash means the user agreed it was bad and acted
-  // on that via a different UI path -- treat it as a match, not a mismatch.
+  // Every category has its own folder, so "not in the expected folder" is a
+  // direct disagreement signal for all five -- except that Fastmail's "report
+  // phishing" button moves mail to Trash rather than Inbox/Suspicious, which
+  // is agreement via a different UI path.
   function agreement(row: ReportRow): "match" | "mismatch" {
     if (row.category === "suspicious" && row.currentPaths.includes("Trash")) return "match";
     return row.currentPaths.includes(row.expectedPath) ? "match" : "mismatch";

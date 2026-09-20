@@ -1,9 +1,7 @@
-// get_triage_report (jmap-triage-mcp tool #3). Calls keyword-scan.ts's
-// scanKeywordState() for category agreement, computes ratios from the
-// mismatches bucket, and does its own separate lightweight notify-keyword
-// scan -- notify is an independent model decision, not part of the
-// category-agreement comparison keyword-scan.ts exists to answer, so it
-// isn't bundled into that shared scan.
+// get_triage_report. Category agreement and its ratios come from
+// keyword-scan.ts; the notify-keyword scan below is separate and
+// lightweight, since notify is an independent model decision rather than
+// part of that category comparison.
 
 import { requireFastmailToken } from "./config.js";
 import { getKnownPromptVersions, scanKeywordState } from "./keyword-scan.js";
@@ -11,9 +9,8 @@ import { bootstrapSession, jmapRequest, CORE, MAIL, type Session } from "./jmap-
 import { MAILBOX_SPECS } from "./mailboxes.js";
 
 export interface TriageReportParams {
-  // Not currently wired into the scan -- keyword-scan.ts's shared query has
-  // no date-bound support at all. Kept on the tool's params for forward
-  // compatibility rather than breaking the schema if this lands later.
+  // Not wired up: the shared scan has no date-bound support. Kept on the
+  // params so adding it later isn't a schema break.
   since?: string;
 }
 
@@ -65,9 +62,7 @@ export async function getTriageReport(_params: TriageReportParams = {}): Promise
     ratios[m.predictedCategory].mismatches++;
   }
 
-  // Own session, independent of scanKeywordState()'s -- deliberately not
-  // shared (see keyword-scan.ts's header comment): notify state isn't part
-  // of what that module scans for.
+  // Own session, deliberately not shared with scanKeywordState().
   const session = await bootstrapSession(requireFastmailToken());
   const versions = await getKnownPromptVersions();
   const notifiedIds = await fetchNotifiedIds(session, versions);

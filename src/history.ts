@@ -1,9 +1,6 @@
-// get_version_history (jmap-triage-mcp tool #2) -- the read side of
-// structured note-taking. Without this, the S3 history approve.ts writes is
-// durable but unusable: the working rule of "treat prior decisions as
-// ground truth before re-proposing something already tried" needs an actual
-// read path to be true in practice. Pure: reads history/index.json + each
-// history/<version>.json, never writes.
+// get_version_history -- the read side of approve.ts's history. Without it
+// that history is durable but unusable: "check what was already tried before
+// re-proposing it" needs a read path. Never writes.
 
 import { requirePromptBucket } from "./config.js";
 import { getJson } from "./s3-json.js";
@@ -27,10 +24,8 @@ export interface VersionRecord {
 
 export interface GetVersionHistoryParams {
   limit?: number;
-  // Return only versions approved after this one (index order), for cheap
-  // pagination through a long history -- most callers (the interactive
-  // loop's "has this been tried before?" check) omit it and get everything
-  // back to the start, most-recent-first.
+  // Only versions approved after this one, for paging a long history. Most
+  // callers omit it and get everything, most-recent-first.
   sinceVersion?: string;
 }
 
@@ -41,15 +36,13 @@ export async function getVersionHistory(params: GetVersionHistoryParams = {}): P
   try {
     index = await getJson<string[]>(bucket, HISTORY_INDEX_KEY);
   } catch (err) {
-    // No approval has ever been written -- an empty history is a normal
-    // starting state, not an error. Any other failure (permissions,
-    // malformed JSON) still propagates.
+    // No approval written yet -- a normal starting state, not an error. Any
+    // other failure (permissions, malformed JSON) still propagates.
     if (err instanceof Error && err.name === "NoSuchKey") return [];
     throw err;
   }
 
-  // index.json is append-order (oldest first, per approve.ts) -- reverse
-  // for the most-recent-first contract callers expect.
+  // index.json is append-order (oldest first); callers expect the reverse.
   let versions = [...index].reverse();
 
   if (params.sinceVersion) {

@@ -1,10 +1,9 @@
 // Classification against GreenPT (api.greenpt.ai), a plain OpenAI
-// chat-completions API. One email per call -- see DECISIONS.md for why this
-// provider, why one email, and what the rollback path is if GreenPT fails.
+// chat-completions API, one email per call. DECISIONS.md has why this
+// provider, why one email, and the rollback path.
 //
-// Changing GREENPT_MODEL_ID also needs a matching entry in model-pacing.ts,
-// or classification runs at the conservative default rather than the model's
-// measured pacing.
+// A new GREENPT_MODEL_ID also needs an entry in model-pacing.ts, or it runs
+// at the conservative default instead of its measured pacing.
 
 import type { TriageEmail } from "./fetch-emails.js";
 
@@ -21,10 +20,9 @@ export type ClassificationOutcome =
   | { id: string; category: string; notify: boolean }
   | { id: string; error: string };
 
-// The model sometimes wraps its JSON in a ```json fence and/or appends
-// trailing prose (e.g. "**Reasoning:** ...") despite being told to reply
-// with ONLY the array. Extract the first balanced top-level [...] instead of
-// assuming the whole response is bare JSON.
+// The model sometimes wraps its JSON in a ```json fence or appends prose
+// ("**Reasoning:** ...") despite being told to reply with ONLY the array --
+// so take the first balanced top-level [...] rather than the whole response.
 export function extractJsonArray(text: string): string | null {
   const start = text.indexOf("[");
   if (start === -1) return null;
@@ -55,10 +53,9 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Retries on 429. Note that a 429 is not necessarily throttling: GreenPT
-// returns 402 Payment Required on exhausted credits, but some gateways signal
-// an empty balance as a 429 with an insufficient_quota code. Retrying that
-// just burns the backoff ladder, so it is surfaced rather than retried.
+// Retries on 429 -- except the ones that aren't throttling: GreenPT returns
+// 402 on exhausted credits, but some gateways signal an empty balance as a
+// 429 with insufficient_quota. Backing off will not add credit.
 async function invokeOpenAICompatible(
   config: ClassifierConfig,
   systemText: string,
@@ -93,9 +90,8 @@ async function invokeOpenAICompatible(
     }
 
     const body = await response.text().catch(() => "");
-    // Billing failures are terminal, not transient -- backing off will not
-    // add credit. Checked before the 429 retry so an empty balance fails
-    // fast with the provider's own message instead of after five sleeps.
+    // Checked before the retry, so an empty balance fails fast with the
+    // provider's own message instead of after five sleeps.
     const billing = response.status === 402 || /insufficient_quota|billing_error/.test(body);
     const throttled = response.status === 429 && !billing;
     if (!throttled || attempt >= MAX_RETRIES) {
@@ -105,9 +101,8 @@ async function invokeOpenAICompatible(
   }
 }
 
-// notify is coerced fail-closed (missing/non-boolean -> false rather than
-// erroring the email out): a lost notification is a mild inconvenience, but a
-// malformed field shouldn't leave the email stuck in Inbox/Triage.
+// notify is fail-closed (missing/non-boolean -> false): a lost push is a mild
+// inconvenience, a stuck email in Inbox/Triage is worse.
 export function parseClassificationResponse(responseText: string, email: TriageEmail): ClassificationOutcome {
   const candidate = extractJsonArray(responseText) ?? responseText;
   let parsed: unknown;
@@ -121,9 +116,9 @@ export function parseClassificationResponse(responseText: string, email: TriageE
     return { id: email.id, error: `Response was not a JSON array: ${responseText.slice(0, 200)}` };
   }
 
-  // The prompt describes an array-in/array-out contract, so the reply is an
-  // array of one -- match on id rather than taking [0], so a model that
-  // echoes something unexpected fails loudly instead of being misattributed.
+  // Array-in/array-out per the prompt, so this is an array of one -- match on
+  // id rather than [0], so an unexpected echo fails loudly instead of being
+  // misattributed.
   for (const item of parsed as Array<{ id?: unknown; category?: unknown; notify?: unknown }>) {
     if (item.id === email.id && typeof item.category === "string") {
       return { id: email.id, category: item.category, notify: item.notify === true };
@@ -132,10 +127,8 @@ export function parseClassificationResponse(responseText: string, email: TriageE
   return { id: email.id, error: `Missing from response: ${responseText.slice(0, 200)}` };
 }
 
-// Wraps the single email in a one-element array: the prompt describes a JSON
-// array of emails in and a JSON array of results out, so the wire format stays
-// an array even though only one email is ever sent. Exported so an eval can
-// send the byte-identical request.
+// One-element array: the prompt describes array-in/array-out, so the wire
+// format stays an array. Exported so an eval sends the identical request.
 export function buildClassifyUserContent(email: TriageEmail): string {
   return JSON.stringify([
     {
@@ -150,18 +143,16 @@ export function buildClassifyUserContent(email: TriageEmail): string {
   ]);
 }
 
-// ~150 tokens covers the id/category/notify JSON itself, but reasoning-first
-// models spend additional tokens on a reasoning block *before* emitting that
-// JSON. 1200 leaves headroom for that and costs nothing extra (GreenPT bills
-// actual output tokens, not maxTokens).
+// ~150 tokens covers the JSON itself; the rest is headroom for a
+// reasoning-first model's preamble. Costs nothing extra -- GreenPT bills
+// actual output tokens, not max_tokens.
 export const CLASSIFY_MAX_TOKENS = 1200;
 
 export async function classifyEmail(
   config: ClassifierConfig,
   email: TriageEmail,
-  // Required, no bundled-constant default -- there is no local fallback
-  // prompt (see DECISIONS.md, "no bundled local prompt"). Every caller
-  // fetches the live prompt from S3 first and passes it in explicitly.
+  // Required, no default: there is no local fallback prompt. Every caller
+  // fetches the live S3 prompt first (DECISIONS.md).
   promptText: string
 ): Promise<ClassificationOutcome> {
   let responseText: string;

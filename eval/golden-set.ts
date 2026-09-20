@@ -1,27 +1,22 @@
-// Synthetic regression fixtures for eval/run-eval.ts. Each case is a
-// hand-written email plus the category (and, where the prompt makes it
-// unambiguous, the notify value) a correct classification against the
-// CURRENTLY LIVE prompt (S3's current.json -- see current-prompt.ts; there
-// is no bundled prompt.ts anymore) should produce. This is not a
-// substitute for reports/generate-report.ts, which audits real mail the
-// user actually received -- these are synthetic, so they can't catch a
-// real-world pattern nobody thought to write down here. What they're for:
-// a fast, free, repeatable check that a prompt change approved via
-// approve_prompt_diff didn't silently break a rule the prompt already
-// relies on (most of these cases exist because a past prompt version got
-// them wrong -- see get_version_history for the version that introduced
-// each rule).
+// Synthetic regression fixtures for eval/run-eval.ts: a hand-written email
+// plus the category (and, where the prompt is unambiguous, the notify value)
+// a correct classification against the live prompt should produce.
 //
-// Add a case here whenever a real classification mismatch turns up in the
-// audit report and gets fixed via approve_prompt_diff -- that's exactly
-// the kind of regression this file exists to catch next time.
+// These are synthetic, so they can't catch a real-world pattern nobody wrote
+// down here -- that's what auditing real mail via get_triage_report is for.
+// What they are is a fast, repeatable check that an approved prompt change
+// didn't break a rule the prompt already relies on. Most cases exist because
+// a past version got them wrong (get_version_history has which).
+//
+// Add a case whenever a real mismatch turns up in an audit and gets fixed via
+// approve_prompt_diff -- that's the regression this file catches next time.
 
 import type { TriageEmail } from "../src/fetch-emails.js";
 
 export interface GoldenCase extends TriageEmail {
   expectedCategory: string;
-  // Omitted where the prompt's notify rules leave real room for judgment --
-  // grading a guess against a guess would just add noise to the report.
+  // Omitted where the notify rules leave real room for judgment -- grading a
+  // guess against a guess is noise.
   expectedNotify?: boolean;
   // Which prompt rule or past mismatch this case is pinned to.
   note: string;

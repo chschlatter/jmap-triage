@@ -1,10 +1,6 @@
-// get_current_prompt (jmap-triage-mcp tool #1) -- reads current.json, the
-// live pointer approve.ts writes. Pure: throws on a failed fetch rather
-// than falling back to anything -- there is no local prompt to fall back
-// to (the real prompt describes a specific person, so a git-committable
-// copy would have to be either generic-and-wrong or
-// PII-bearing-and-uncommittable). Every caller (CLI, eval, Lambda,
-// jmap-triage-mcp) fetches this live.
+// get_current_prompt -- reads current.json, the live pointer approve.ts
+// writes and every caller (CLI, eval, Lambda, MCP) fetches. Throws on a
+// failed fetch; there is no local prompt to fall back to (DECISIONS.md).
 
 import { requirePromptBucket } from "./config.js";
 import { getJson } from "./s3-json.js";

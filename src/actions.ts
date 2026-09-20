@@ -6,26 +6,20 @@ import { MAILBOX_SPECS, type MailboxRefs } from "./mailboxes.js";
 import type { TriageEmail } from "./fetch-emails.js";
 import type { ClassificationOutcome } from "./classify.js";
 
-// Below typical JMAP server maxObjectsInSet limits -- confirm against
-// session.capabilities["urn:ietf:params:jmap:core"].maxObjectsInSet if this
-// is ever raised.
+// Below typical JMAP maxObjectsInSet limits -- confirm against
+// session.capabilities[...:core].maxObjectsInSet before raising this.
 const WRITE_BATCH_SIZE = 50;
 
 export interface Destination {
   mailboxId: string;
-  // Full path, matching the Fastmail web UI's deep-link URL segment for a
-  // nested mailbox (see notify.ts).
+  // Full path -- matches the Fastmail web UI's deep-link segment (notify.ts).
   path: string;
 }
 
-// Derived from MAILBOX_SPECS (mailboxes.ts) instead of a hand-written
-// record literal -- that table is the single place a category's mailbox is
-// named, so this function can't drift out of sync with it. Each category
-// with a destination gets its own mailbox rather than sharing one: the
-// $ai-* keyword a move stamps isn't surfaced anywhere in the Fastmail UI,
-// so without a distinct destination there'd be no in-reader indicator that
-// an email had been flagged -- only the Pushover ping, easy to miss after
-// the fact.
+// Derived from MAILBOX_SPECS so it can't drift out of sync. Every category
+// gets its own mailbox rather than sharing one: the $ai-* keyword isn't
+// surfaced anywhere in the Fastmail UI, so a distinct destination is the only
+// in-reader indicator of what the AI decided.
 export function destinationsFor(mailboxes: MailboxRefs): Record<string, Destination> {
   const destinations: Record<string, Destination> = {};
   for (const spec of MAILBOX_SPECS) {
@@ -40,18 +34,13 @@ export interface PlannedAction {
   category: string;
   notify: boolean;
   destination: Destination;
-  // $ai-<promptVersion>-<category>, e.g. "$ai-vN-inbox". Stamped on the
-  // email as a keyword at move time so get_triage_report/evaluate_candidate
-  // can compare this original classification against wherever the email
-  // ends up after the user files it manually -- independent of
-  // PlannedAction.destination, which only reflects where the AI filed it
-  // just now.
+  // $ai-<promptVersion>-<category>, stamped at move time so
+  // get_triage_report/evaluate_candidate can compare the original
+  // classification against wherever the user later files the email.
   keyword: string;
-  // $ai-<promptVersion>-notified, present only when notify is true (absent
-  // = false, same fail-closed convention as everywhere else -- see
-  // classify.ts). Records that this email was flagged for a push, not that
-  // Pushover delivery actually succeeded; those are different failure
-  // modes and main.ts's notify stage can fail independently of this.
+  // $ai-<promptVersion>-notified, written only when notify is true. Records
+  // that the email was flagged for a push, not that Pushover delivery
+  // succeeded -- main.ts's notify stage fails independently of this.
   notifiedKeyword: string;
 }
 
@@ -68,15 +57,11 @@ function aiNotifiedKeyword(promptVersion: string): string {
   return `$ai-${promptVersion}-notified`;
 }
 
-// Pure planning step -- no writes. A classification failure, or a category
-// string the mapping doesn't recognize, is skipped rather than moved: the
-// email is simply left in Inbox/Triage for the next run (or a human) to
-// deal with.
+// Pure -- no writes. A classification failure or an unrecognized category is
+// skipped, leaving the email in Inbox/Triage for the next run or a human.
 //
-// promptVersion is the version that actually produced `outcomes` -- passed
-// in explicitly rather than read from a shared constant, so the keyword
-// stamped on each email always matches the prompt that classified it (the
-// live S3 prompt every caller fetches -- see current-prompt.ts).
+// promptVersion is the version that actually produced `outcomes`, passed in
+// explicitly so each stamped keyword matches the prompt that classified it.
 export function planActions(
   emails: TriageEmail[],
   outcomes: ClassificationOutcome[],
@@ -127,17 +112,14 @@ function chunk<T>(arr: T[], size: number): T[][] {
   return out;
 }
 
-// Moves are patch updates on mailboxIds ({"mailboxIds/<triageId>": null,
-// "mailboxIds/<destId>": true}), not a wholesale replace -- an email can
-// belong to more than one mailbox at once in JMAP, and patching only the two
-// entries in play leaves any other membership untouched. Batched (unlike
-// classification's one-call-per-email): there's no model-accuracy
-// constraint on Email/set, so multiple emails' updates share one call.
-// Email/set's response separates updated from notUpdated per id, so one
-// rejected email doesn't fail the rest of its batch. The $ai-* keyword
-// (PlannedAction.keyword) rides in the same patch object as the mailbox
-// change -- one write per email, not two -- so a move and its keyword
-// always succeed or fail together.
+// A move is a patch on mailboxIds, not a wholesale replace -- an email can
+// belong to several mailboxes, and patching only the two entries in play
+// leaves the rest untouched. The $ai-* keyword rides in the same patch, so a
+// move and its tag always succeed or fail together.
+//
+// Batched, unlike classification: Email/set has no accuracy constraint, and
+// its response separates updated from notUpdated per id, so one rejected
+// email doesn't fail the rest of its batch.
 export async function applyMoves(
   session: Session,
   triageMailboxId: string,

@@ -1,5 +1,4 @@
-// JMAP session bootstrap and the generic request helper every other module
-// builds on.
+// JMAP session bootstrap + the request helper every other module builds on.
 
 export const SESSION_URL = "https://api.fastmail.com/jmap/session";
 export const CORE = "urn:ietf:params:jmap:core";

@@ -1,25 +1,12 @@
-// jmap-triage-mcp adapter: registers the 5 prompt-governance tools (see
-// ARCHITECTURE.md) as MCP tools, and serves them over Streamable
-// HTTP. Same seam as runPipeline (main.ts): current-prompt.ts,
-// history.ts, report.ts, evaluate.ts and approve.ts are plain, deterministic
-// TypeScript with no knowledge of MCP or any other caller; this file is a
-// thin shell around them.
+// jmap-triage-mcp: registers the 5 prompt-governance tools (ARCHITECTURE.md)
+// and serves them over Streamable HTTP. Same seam as runPipeline (main.ts) --
+// current-prompt.ts, history.ts, report.ts, evaluate.ts and approve.ts are
+// plain TypeScript with no knowledge of MCP; this file is a thin shell.
 //
-// Deployment shape: remote, publicly-reachable (Streamable HTTP), not local
-// stdio -- the review session runs through Claude's hosted chat interface
-// via a custom connector, same reason the existing Fastmail connector is
-// remote. Runs as a plain Node http server; template.yaml fronts it with a
-// Lambda Function URL (RESPONSE_STREAM) via the AWS Lambda Web Adapter,
-// which just execs this file and proxies HTTP to whatever port it listens
-// on -- no Lambda-specific glue code needed in here.
-//
-// Auth: Fastmail and GreenPT credentials are read the same way every other
-// module in this repo reads them (config.ts, process.env) -- this
-// server runs with its own Lambda execution role and its own SSM
-// parameters (see template.yaml), same SecureString pattern lambda.ts
-// already uses. Auth for the transport itself is a single static bearer
-// token (env var MCP_BEARER_TOKEN, or MCP_BEARER_TOKEN_PARAM for an
-// SSM-backed value) -- the simplest fit for a single-user server.
+// Remote and publicly reachable rather than local stdio, because the review
+// session runs through Claude's hosted chat interface via a custom connector.
+// A plain Node http server: the Lambda Web Adapter execs this file and
+// proxies HTTP to its port, so there is no Lambda-specific code here.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { GetParameterCommand, SSMClient } from "@aws-sdk/client-ssm";
@@ -45,10 +32,9 @@ function errorResult(err: unknown) {
   return { content: [{ type: "text" as const, text: message }], isError: true };
 }
 
-// One McpServer + one tool registration pass, called fresh per HTTP request
-// (see the stateless-mode handler below) -- cheap (five closures over
-// already-imported pure functions), and it means a request can never see
-// another request's in-flight state.
+// Called fresh per HTTP request (stateless mode, below) -- cheap, five
+// closures over already-imported pure functions, and no request can see
+// another's in-flight state.
 export function createMcpServer(): McpServer {
   const server = new McpServer(SERVER_INFO);
 
@@ -113,7 +99,7 @@ export function createMcpServer(): McpServer {
     {
       title: "Evaluate candidate prompt",
       description:
-        "Static gate (version bump, JSON-reply shape intact, category vocabulary set-equal to the folder map -- always checked against the FULL vocabulary regardless of `category`), then, only if it passes, replay against corrections and a counterweight sample derived live from JMAP keyword state and prior approval history -- no stored corpus. Returns {gate, fixes, corrections, regressions} -- read-only, no writes. gate.candidateCategories echoes the category names parsed out of the candidate's CATEGORY section, regardless of pass/fail. corrections lists every open mismatch this call attempted to replay, each with status 'fixed' | 'unfixed' | 'error' -- fixes is just the 'fixed' subset, kept for convenience; check corrections when fixes comes back empty to see whether a message is still misclassifying (status 'unfixed', actualCategory shows what the model said instead) or the classify call itself failed (status 'error', see the error field) rather than assuming 'empty fixes' means nothing happened. regressions lists only counterweight rows that broke ('regressed') or errored ('error') -- a row that stayed correct isn't included. Pass `category` to scope the replay to just that one category (recommended when the diff only touches one category's wording -- the common case) for a faster, more thorough per-category check; omit it for a full sweep across all categories. Even scoped, this takes real time (real classification calls, not a lookup) -- treat anything under a few minutes as expected, not a hang.",
+        "Read-only. Static gate (version bump, JSON-reply shape intact, category vocabulary set-equal to the folder map -- always the FULL vocabulary, regardless of `category`), then, only if it passes, a replay against open corrections and a counterweight sample derived live from JMAP keyword state and prior approvals. No stored corpus. Returns {gate, fixes, corrections, regressions}. gate.candidateCategories echoes what was parsed out of the candidate's CATEGORY section, pass or fail. corrections lists every open mismatch replayed, with status 'fixed' | 'unfixed' | 'error'; fixes is just the 'fixed' subset. When fixes is empty, read corrections rather than assuming nothing happened -- 'unfixed' means still misclassifying (actualCategory shows what the model said), 'error' means the classify call itself failed. regressions lists only counterweight rows that broke or errored. Pass `category` to scope the replay to one category -- recommended when the diff touches only that category's wording, the common case -- or omit it for a full sweep. Either way this makes real classification calls, so a few minutes is expected, not a hang.",
       inputSchema: {
         version: z.string(),
         prompt: z.string(),
@@ -160,22 +146,13 @@ export function createMcpServer(): McpServer {
   return server;
 }
 
-// --- Bearer-token auth for the transport itself ---
+// --- Bearer-token auth for the transport ---
 //
-// OPEN BY DEFAULT (no MCP_BEARER_TOKEN/MCP_BEARER_TOKEN_PARAM configured):
-// Claude.ai's custom-connector UI only reliably offers full OAuth 2.0 or no
-// auth at all for an individual account -- the static-header option
-// (`static_headers`, a fixed bearer token entered by an org admin) is beta
-// and gated to Team/Enterprise workspaces, and a token embedded in the
-// connector URL is explicitly discouraged (Claude's own connector-auth
-// docs: URLs get logged in proxies/browser history). Given that, the
-// deliberate choice here is to run without app-level auth for now, relying
-// on the Function URL's own unguessable subdomain -- weak,
-// not a real access control, but this is a single-user personal tool, not
-// a shared service. The check below still activates automatically the
-// moment either env var is set (e.g. after building real OAuth, or if
-// static_headers becomes available), so re-enabling it needs no code
-// change, just a redeploy.
+// OPEN BY DEFAULT: with neither MCP_BEARER_TOKEN nor MCP_BEARER_TOKEN_PARAM
+// set, every request is authorized. That is deliberate -- see README.md's
+// "Auth is off by deliberate choice" for why, and what it costs. The check
+// activates the moment either var is set, so re-enabling is a redeploy, not
+// a code change.
 let bearerTokenPromise: Promise<string> | undefined;
 
 function bearerConfigured(): boolean {
@@ -210,19 +187,15 @@ async function isAuthorized(req: IncomingMessage): Promise<boolean> {
   return match?.[1] === expected;
 }
 
-// --- Secrets: fetched from SSM at first use, same cold-start-cache pattern
-// lambda.ts uses for TriageFunction's, then exposed through process.env the
-// way every module already reads them (config.ts's require*) -- so those
-// modules stay unaware this server fetches them any differently than the
-// CLI/eval path does.
+// Secrets: same cold-start cache as lambda.ts, but exposed through
+// process.env, the way config.ts's require* already reads them everywhere --
+// so those modules stay unaware this server fetches them at all.
 //
-// Populates process.env[envVar] from an SSM SecureString named by
+// Populates process.env[envVar] from the SSM SecureString named by
 // process.env[paramEnvVar], once per container. Both credentials the tools
-// need -- FASTMAIL_TOKEN for report.ts/evaluate.ts, GREENPT_API_KEY for
-// evaluate.ts's requireModelConfig() -- load the same way, so this is one
-// helper rather than one function per secret. A missing *_PARAM is a silent
-// no-op: config.ts's require* raises its own clear error if the value is then
-// actually needed, and local dev sets these via .env instead.
+// need load this way, hence one helper rather than one per secret. A missing
+// *_PARAM is a silent no-op: config.ts raises a clear error if the value is
+// actually needed, and local dev sets these via .env.
 const ssmLoads = new Map<string, Promise<void>>();
 
 function ensureEnvFromSsm(envVar: string, paramEnvVar: string): Promise<void> {
@@ -249,10 +222,9 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return raw.length > 0 ? JSON.parse(raw) : undefined;
 }
 
-// Stateless mode: a fresh McpServer + transport per request, no session id,
-// no resumability -- the right fit for a server that can be freely
-// recycled between invocations rather than holding long-lived in-memory
-// session state, per the SDK's own stateless-mode guidance.
+// Stateless mode per the SDK's guidance: fresh McpServer + transport per
+// request, no session id, no resumability -- the right fit for a server
+// freely recycled between invocations.
 async function handleMcpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (req.method !== "POST") {
     res.writeHead(405, { "content-type": "application/json" }).end(JSON.stringify({ error: "method not allowed" }));
@@ -324,17 +296,12 @@ export function startHttpServer(port: number): void {
   });
 }
 
-// Always the entrypoint in practice (local `npx tsx src/mcp-server.ts`, or
-// `node mcp-server.js` execed by run.sh under the Lambda Web Adapter -- see
-// run.sh/template.yaml) -- there's no other module that imports this file,
-// so an isMain guard would just be dead weight. No top-level await, though:
-// run.sh's `node mcp-server.js` runs the CJS bundle directly, and CJS
-// output can't have top-level await (esbuild rejects it), so this is
-// wrapped in an IIFE instead.
+// Nothing imports this file, so an isMain guard would be dead weight. The
+// IIFE is not: run.sh runs the CJS bundle directly, and esbuild rejects
+// top-level await in CJS output.
 (async () => {
-  // Harmless no-op in Lambda (no .env file is packaged, and this never
-  // overwrites an already-set env var) -- same as eval/run-eval.ts calling
-  // it unconditionally regardless of environment.
+  // No-op in Lambda -- no .env is packaged, and this never overwrites an
+  // already-set env var.
   await loadEnvFile();
   const port = Number(process.env.PORT ?? 8080);
   startHttpServer(port);

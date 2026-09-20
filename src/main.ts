@@ -1,7 +1,6 @@
-// Orchestrates the full pipeline: classify -> act (move) -> notify.
-// runPipeline() is the reusable pipeline body; main() is the CLI-only shell
-// around it (argv, .env) -- the Lambda handler (src/lambda.ts) calls
-// runPipeline() directly, with its own config assembled from SSM/env instead.
+// Orchestrates the pipeline: classify -> act (move) -> notify. runPipeline()
+// is the reusable body; main() is the CLI-only shell (argv, .env) around it.
+// lambda.ts calls runPipeline() directly with its own config.
 
 import {
   loadEnvFile,
@@ -23,8 +22,7 @@ import { sendPushoverNotification } from "./notify.js";
 import { getConcurrency, runPaced } from "./model-pacing.js";
 import { getCurrentPrompt } from "./current-prompt.js";
 
-// Every run summary in here is a titled table that's worth printing only if
-// it has rows -- an empty "Move failures" section is noise, not information.
+// An empty "Move failures" section is noise, not information.
 function printTable(title: string, rows: object[]) {
   if (rows.length === 0) return;
   console.log(`\n--- ${title} ---`);
@@ -37,10 +35,8 @@ export interface PipelineConfig {
   pushover: PushoverConfig | null;
   mailboxOverrides: MailboxOverrides;
   options: CliOptions;
-  // Live prompt to classify with -- always the S3-fetched current.json (see
-  // current-prompt.ts), no bundled local fallback. Required, not optional:
-  // there is no offline default, so every caller -- CLI main() below and
-  // lambda.ts alike -- fetches it before building this config.
+  // The S3-fetched current.json. Required, not optional -- there is no
+  // offline default, so every caller fetches it before building this config.
   prompt: { version: string; text: string };
 }
 
@@ -57,9 +53,8 @@ export async function runPipeline(config: PipelineConfig) {
     return;
   }
 
-  // --- Classify (one call per email; concurrency and pacing from
-  // model-pacing.ts's runPaced() -- the same policy evaluate_candidate's
-  // live-mail replay uses, so a model change stays safe in both places) ---
+  // --- Classify: one call per email, paced by runPaced() -- the same policy
+  // evaluate_candidate's replay uses, so a model change stays safe in both.
 
   console.log(`Classifying ${emails.length} email(s) via GreenPT ${model.modelId} (concurrency: ${getConcurrency()})...`);
   const outcomes = await runPaced(
@@ -151,9 +146,8 @@ export async function runPipeline(config: PipelineConfig) {
   printTable("Notifications", notificationRows);
 }
 
-// CLI-only shell: argv parsing, .env loading. Kept separate from
-// runPipeline() (above) so the Lambda handler can call runPipeline() directly
-// with its own config, without inheriting argv/.env assumptions.
+// CLI-only shell: argv, .env. Separate from runPipeline() so the Lambda
+// handler doesn't inherit argv/.env assumptions.
 export async function main() {
   await loadEnvFile();
 
@@ -161,8 +155,7 @@ export async function main() {
   const token = requireFastmailToken();
   const model = requireModelConfig();
   const pushover: PushoverConfig | null = options.notify ? requirePushoverConfig() : null;
-  // No bundled local prompt to fall back to -- CLI runs need PROMPT_BUCKET
-  // set (same as jmap-triage-mcp already required) and S3 read access.
+  // No local fallback prompt, so a CLI run needs PROMPT_BUCKET and S3 reads.
   const current = await getCurrentPrompt();
 
   await runPipeline({
