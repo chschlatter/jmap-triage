@@ -7,6 +7,12 @@ import { CORE, MAIL, jmapRequest, type Session } from "./jmap-session.js";
 // Server-side cap, passed to Email/get rather than sliced client-side: JMAP
 // truncates on a valid UTF-8 boundary.
 const MAX_BODY_VALUE_BYTES = 4000;
+// Evidence reads the HTML part separately and much further in. Marketing HTML
+// routinely spends its first several kB on head, CSS and an invisible
+// preheader, so at 4000 bytes most messages yielded no links at all. This
+// budget is never sent to the model -- only link and hidden-text facts are
+// derived from it -- so it costs bandwidth, not tokens.
+const MAX_EVIDENCE_HTML_BYTES = 60_000;
 // Keeps a pathological attachment list (a newsletter with dozens of inline
 // images) from eating the token budget for no classification benefit.
 const MAX_ATTACHMENTS = 10;
@@ -20,6 +26,26 @@ export interface TriageEmail {
   body: string;
   attachments: string[];
   preview: string;
+  raw?: EmailRaw;
+}
+
+// Round-1 inputs, consumed only by evidence.ts. Optional because the
+// golden-set fixtures build TriageEmail literals by hand; a required field
+// would break all of them.
+export interface EmailRaw {
+  fromName: string;
+  replyTo: string;
+  rawHtml: string;
+  // Fastmail splits its Authentication-Results across several header
+  // instances, so this is every instance, in order -- evidence.ts merges the
+  // ones whose authserv-id is Fastmail's own.
+  authResults: string[];
+  icloudHme: string | null;
+  returnPath: string | null;
+  spamScore: string | null;
+  spamHits: string | null;
+  spamKnownSender: string | null;
+  spamReputation: string | null;
 }
 
 function formatAddresses(addrs: Array<{ name?: string | null; email: string }> | null | undefined): string {
@@ -64,10 +90,59 @@ function extractAttachmentNames(m: any): string[] {
     .slice(0, MAX_ATTACHMENTS);
 }
 
-const EMAIL_GET_PROPERTIES = ["subject", "from", "to", "receivedAt", "textBody", "htmlBody", "attachments", "preview"];
+// The unconverted text/html part. extractBodyText prefers text/plain, where
+// anchor text and href have already been flattened away, so link evidence has
+// to come from here instead.
+function extractRawHtml(m: any): string {
+  const bodyValues: Record<string, { value: string }> = m.bodyValues ?? {};
+  const part =
+    (m.textBody ?? []).find((p: any) => p.type === "text/html" && bodyValues[p.partId]) ??
+    (m.htmlBody ?? []).find((p: any) => bodyValues[p.partId]);
+  return part ? bodyValues[part.partId].value : "";
+}
+
+// `bodyValues` has to be listed explicitly: Fastmail honours the properties
+// list strictly and returns no bodyValues without it, whatever
+// fetchTextBodyValues says -- which silently emptied every classified body.
+const EMAIL_GET_PROPERTIES = [
+  "subject",
+  "from",
+  "to",
+  "receivedAt",
+  "textBody",
+  "htmlBody",
+  "bodyValues",
+  "attachments",
+  "preview",
+  "replyTo",
+  // :all because Fastmail emits Authentication-Results four times per
+  // message, one group of methods each.
+  "header:Authentication-Results:asText:all",
+  "header:X-Icloud-Hme:asText",
+  "header:Return-Path:asText",
+  "header:X-Spam-score:asText",
+  "header:X-Spam-hits:asText",
+  "header:X-Spam-known-sender:asText",
+  "header:X-Spam-sender-reputation:asText",
+];
 const EMAIL_GET_BODY_PROPERTIES = ["partId", "type", "name", "disposition"];
 
-function toTriageEmail(m: any): TriageEmail {
+function toEmailRaw(m: any, html: string): EmailRaw {
+  return {
+    fromName: m.from?.[0]?.name ?? "",
+    replyTo: formatAddresses(m.replyTo),
+    rawHtml: html,
+    authResults: m["header:Authentication-Results:asText:all"] ?? [],
+    icloudHme: m["header:X-Icloud-Hme:asText"] ?? null,
+    returnPath: m["header:Return-Path:asText"] ?? null,
+    spamScore: m["header:X-Spam-score:asText"] ?? null,
+    spamHits: m["header:X-Spam-hits:asText"] ?? null,
+    spamKnownSender: m["header:X-Spam-known-sender:asText"] ?? null,
+    spamReputation: m["header:X-Spam-sender-reputation:asText"] ?? null,
+  };
+}
+
+function toTriageEmail(m: any, htmlById: Map<string, string>): TriageEmail {
   return {
     id: m.id,
     subject: m.subject ?? "",
@@ -77,7 +152,24 @@ function toTriageEmail(m: any): TriageEmail {
     body: extractBodyText(m),
     attachments: extractAttachmentNames(m),
     preview: m.preview ?? "",
+    raw: toEmailRaw(m, htmlById.get(m.id) ?? extractRawHtml(m)),
   };
+}
+
+// The second Email/get in each request: the HTML part alone, at the evidence
+// budget. maxBodyValueBytes is per-request, so it takes its own call -- but
+// it rides along in the same round trip.
+function evidenceHtmlCall(accountId: string, ids: unknown, callId: string) {
+  return [
+    "Email/get",
+    { accountId, ...(ids as object), properties: ["id", "htmlBody", "bodyValues"], bodyProperties: ["partId", "type"], fetchHTMLBodyValues: true, maxBodyValueBytes: MAX_EVIDENCE_HTML_BYTES },
+    callId,
+  ];
+}
+
+function htmlMapFrom(data: any, callId: string): Map<string, string> {
+  const list: any[] = data.methodResponses.find((m: any) => m[2] === callId)?.[1]?.list ?? [];
+  return new Map(list.map((m) => [m.id, extractRawHtml(m)]));
 }
 
 export async function fetchTriageEmails(session: Session, mailboxId: string, limit: number): Promise<TriageEmail[]> {
@@ -105,6 +197,7 @@ export async function fetchTriageEmails(session: Session, mailboxId: string, lim
       },
       "b",
     ],
+    evidenceHtmlCall(session.accountId, { "#ids": { resultOf: "a", name: "Email/query", path: "/ids" } }, "c"),
   ]);
 
   const emailGet = data.methodResponses.find((m: any) => m[2] === "b")?.[1];
@@ -112,7 +205,8 @@ export async function fetchTriageEmails(session: Session, mailboxId: string, lim
     throw new Error(`Unexpected JMAP response: ${JSON.stringify(data, null, 2)}`);
   }
 
-  return (emailGet.list as any[]).map(toTriageEmail);
+  const htmlById = htmlMapFrom(data, "c");
+  return (emailGet.list as any[]).map((m) => toTriageEmail(m, htmlById));
 }
 
 // By id, wherever the message currently lives -- evaluate.ts's replay needs
@@ -135,6 +229,7 @@ export async function fetchEmailsByIds(session: Session, ids: string[]): Promise
       },
       "a",
     ],
+    evidenceHtmlCall(session.accountId, { ids }, "b"),
   ]);
 
   const emailGet = data.methodResponses.find((m: any) => m[2] === "a")?.[1];
@@ -142,5 +237,6 @@ export async function fetchEmailsByIds(session: Session, ids: string[]): Promise
     throw new Error(`Unexpected JMAP response: ${JSON.stringify(data, null, 2)}`);
   }
 
-  return (emailGet.list as any[]).map(toTriageEmail);
+  const htmlById = htmlMapFrom(data, "b");
+  return (emailGet.list as any[]).map((m) => toTriageEmail(m, htmlById));
 }
