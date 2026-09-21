@@ -72,7 +72,13 @@ async function main() {
     console.log(`[${i + 1}/${GOLDEN_SET.length}] ${c.id}... ${status}`);
   });
 
-  const categoryMismatches = rows.filter((r) => !r.categoryOk);
+  // A failed API call is not a wrong answer. Scoring it as a category
+  // mismatch (and, because notifyOk stays undefined on an error row, leaving
+  // notify untouched) makes a provider outage look exactly like a prompt
+  // regression -- which it did once, on a 395s run that scored 30/36 while
+  // notify stayed normal. Errors are counted and reported on their own.
+  const errored = rows.filter((r) => r.error);
+  const categoryMismatches = rows.filter((r) => !r.categoryOk && !r.error);
   const notifyMismatches = rows.filter((r) => r.notifyOk === false);
 
   console.log("\n--- Results ---");
@@ -93,8 +99,15 @@ async function main() {
     console.log("\n--- Category mismatches ---");
     for (const r of categoryMismatches) {
       const note = GOLDEN_SET.find((c) => c.id === r.id)?.note ?? "";
-      console.log(`  ${r.id}: expected "${r.expectedCategory}", got "${r.actualCategory}"${r.error ? ` (${r.error})` : ""}`);
+      console.log(`  ${r.id}: expected "${r.expectedCategory}", got "${r.actualCategory}"`);
       console.log(`    rule: ${note}`);
+    }
+  }
+
+  if (errored.length > 0) {
+    console.log("\n--- Errors (not scored) ---");
+    for (const r of errored) {
+      console.log(`  ${r.id}: ${r.error}`);
     }
   }
 
@@ -107,13 +120,15 @@ async function main() {
     }
   }
 
-  const gradedNotifyCount = rows.filter((r) => r.expectedNotify !== undefined).length;
+  const gradedCount = rows.length - errored.length;
+  const gradedNotifyCount = rows.filter((r) => r.expectedNotify !== undefined && !r.error).length;
   console.log(
-    `\n${rows.length - categoryMismatches.length}/${rows.length} category match, ` +
-      `${gradedNotifyCount - notifyMismatches.length}/${gradedNotifyCount} notify match`
+    `\n${gradedCount - categoryMismatches.length}/${gradedCount} category match, ` +
+      `${gradedNotifyCount - notifyMismatches.length}/${gradedNotifyCount} notify match` +
+      (errored.length > 0 ? `, ${errored.length} error(s) not scored -- re-run before reading this as a regression` : "")
   );
 
-  if (categoryMismatches.length > 0) {
+  if (categoryMismatches.length > 0 || errored.length > 0) {
     process.exitCode = 1;
   }
 }

@@ -4,6 +4,7 @@
 // category is one row here rather than edits in lockstep across files.
 
 import { CORE, MAIL, jmapRequest, type Session } from "./jmap-session.js";
+import type { StageKey } from "./stages.js";
 
 interface MailboxSpec {
   key: string;
@@ -12,21 +13,38 @@ interface MailboxSpec {
   envVar: string;
   // Only set for destinations -- Inbox/Triage is the source, so it omits it.
   category?: string;
+  // Which round decides this destination. Suspicious is round 1's only
+  // output, so it is excluded from round 2's vocabulary while keeping its
+  // mailbox -- see categoriesForStage below.
+  stage?: StageKey;
 }
 
 export const MAILBOX_SPECS = [
   { key: "triageId", path: ["Inbox", "Triage"], envVar: "TRIAGE_MAILBOX_ID", category: undefined },
-  { key: "inboxId", path: ["Inbox"], envVar: "INBOX_MAILBOX_ID", category: "inbox" },
-  { key: "inboxOrdersId", path: ["Inbox", "Orders"], envVar: "INBOX_ORDERS_MAILBOX_ID", category: "orders" },
+  { key: "inboxId", path: ["Inbox"], envVar: "INBOX_MAILBOX_ID", category: "inbox", stage: "triage" },
+  { key: "inboxOrdersId", path: ["Inbox", "Orders"], envVar: "INBOX_ORDERS_MAILBOX_ID", category: "orders", stage: "triage" },
   {
     key: "inboxSuspiciousId",
     path: ["Inbox", "Suspicious"],
     envVar: "INBOX_SUSPICIOUS_MAILBOX_ID",
     category: "suspicious",
+    stage: "phish",
   },
-  { key: "inboxNewsId", path: ["Inbox", "News"], envVar: "INBOX_NEWS_MAILBOX_ID", category: "newsletters" },
-  { key: "archivedNoiseId", path: ["Archive", "Noise"], envVar: "ARCHIVE_NOISE_MAILBOX_ID", category: "noise" },
+  { key: "inboxNewsId", path: ["Inbox", "News"], envVar: "INBOX_NEWS_MAILBOX_ID", category: "newsletters", stage: "triage" },
+  { key: "archivedNoiseId", path: ["Archive", "Noise"], envVar: "ARCHIVE_NOISE_MAILBOX_ID", category: "noise", stage: "triage" },
 ] as const satisfies readonly MailboxSpec[];
+
+// The categories one round may answer with. Round 1's vocabulary is
+// {phishing, clean} (see stages.ts); this is the folder-backed half of it.
+export function categoriesForStage(stage: StageKey): string[] {
+  return MAILBOX_SPECS.flatMap((s) => (s.category && s.stage === stage ? [s.category as string] : []));
+}
+
+// Every folder-backed category across both rounds -- for destination lookup
+// and the keyword scan, which have to cover whatever any round produced.
+export function allCategories(): string[] {
+  return MAILBOX_SPECS.flatMap((s) => (s.category ? [s.category as string] : []));
+}
 
 export type MailboxKey = (typeof MAILBOX_SPECS)[number]["key"];
 export type MailboxRefs = Record<MailboxKey, string>;

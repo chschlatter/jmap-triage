@@ -70,8 +70,13 @@ Parameters:
       are resolved.
   Limit:
     Type: Number
-    Default: 20
-    Description: Max messages fetched from Inbox/Triage per invocation.
+    Default: 10
+    Description: >
+      Max messages fetched from Inbox/Triage per invocation. Each message
+      costs two model calls (round 1 phishing filter, then round 2 category
+      triage), so 10 is 20 calls -- two waves at the classifier's concurrency,
+      which fits the 240s Timeout even on the provider's slow days. Raising
+      this means re-checking that budget; see DECISIONS.md.
   McpBearerTokenParam:
     Type: String
     Default: /jmap-triage/mcp-bearer-token
@@ -150,9 +155,13 @@ Resources:
             - Sid: ReadLivePrompt
               Effect: Allow
               Action: s3:GetObject
-              # Read-only on current.json: this function never touches
-              # history/* and never approves a version.
-              Resource: !Sub "${PromptStoreBucket.Arn}/current.json"
+              # Read-only on each round's live pointer: this function never
+              # touches history/* and never approves a version. Two keys
+              # because triage runs in two rounds, each with its own prompt
+              # and version line (stages.ts).
+              Resource:
+                - !Sub "${PromptStoreBucket.Arn}/current.json"
+                - !Sub "${PromptStoreBucket.Arn}/phish/current.json"
             - Sid: ReadTriageSecrets
               Effect: Allow
               Action:

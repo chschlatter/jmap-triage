@@ -42,6 +42,67 @@ to 537 req/min at the top. GreenPT publishes no rate limits and returns no
   delay costs ~0.75s across a 20-email invocation; worst case that invocation
   needs ~34s of the 240s budget.
 
+**Latency re-measured 2026-09-21: wildly variable, so plan for the tail.**
+Across one session GreenPT served the same 36-case golden set in anywhere
+from **10s to 395s** at the same concurrency. Per-call latency ranged from
+~3s in fast periods to ~30s in slow ones, with a 94s outlier. Within any one
+period it is flat in input size (269 vs 1528 prompt tokens both ~30s for
+45-60 output tokens), so the slow periods are provider capacity, not our
+payload, and not queueing: a 1/4/8/16 concurrency probe during a slow period
+measured 0.03 / 0.14 / 0.31 / 0.49 req/s with **zero** throttled or failed at
+every level. Throughput scales with concurrency at any latency.
+
+The practical consequence is that a single timing or quality number means
+nothing. Size the pacing against the slow case, not the median.
+
+**So concurrency moved 4 -> 10.** The binding constraint is no longer peak
+demand, it is wave count against a fixed timeout. `LIMIT=20` costs
+`ceil(20/concurrency)` waves of up to 94s:
+
+| concurrency | waves | worst case | 240s budget |
+|---|---|---|---|
+| 4 | 5 | 470s | over |
+| 8 | 3 | 282s | over |
+| **10** | **2** | **188s** | **fits** |
+| 16+ | 2 | 188s | no further gain at `LIMIT=20` |
+
+10 is the smallest value that makes the worst observed case fit, and past it
+the wave count stops improving, so more concurrency would be risk without
+benefit. This also pulls `evaluate_candidate` back inside Claude Desktop's
+240s MCP timeout: a ~50-call replay was 13 waves (~390s) at concurrency 4 and
+is 5 waves (~150s) at 10.
+
+Offline callers can override per call — `eval/ph1/run-ph1.ts` runs at 16
+(`PH1_CONCURRENCY`), which took a 57-call run from ~7 minutes to 21s.
+
+## 2026-09-21 — round 1's `signal` field is load-bearing, not decoration
+
+DESIGN-v8 §5.3 asked whether round 1's `signal` enum was worth its schema
+surface, given the project rejects model self-report for rule attribution
+(DESIGN-v7). It was dropped on that reasoning while moving the prompt into
+S3 — and the offline score fell from 57/57 to 56/57, with the **same**
+message flipping phishing → clean on three consecutive runs (an unsolicited
+offer from a throwaway domain). Restoring the field restored 57/57.
+
+So the enum is not display: asking the model to name which signal it acted on
+makes it check the list, and without that it reads a throwaway-domain
+solicitation as ordinary marketing. It stays in the prompt as reasoning
+scaffolding.
+
+The self-report stance is unchanged — `signal` is shown in the round-1 table
+and never used to attribute a decision to a prompt rule, so nothing tunes
+against it. This is also a reminder that "this field is only for display"
+is a claim to measure, not to assume.
+
+**Reading `npm run eval` scores.** Seven runs of the unchanged v10 prompt in
+one session scored category 30, 35, 35, 35, 36, 36, 36 out of 36 and notify
+30-31/36. Six cluster at 35-36; the 30 was the 395s run. `buildRow` sets
+`categoryOk: false` on a failed API call but leaves `notifyOk` undefined, and
+the notify filter tests `=== false`, so **API failures depress the category
+score and leave notify untouched** — which is precisely the shape of that
+run. Treat a category score more than one or two below 36 as a provider
+symptom to re-run, not a regression, and check the error count first.
+
 **Cost.** ~EUR 0.15-1.40/month at 100 emails/day. 90-97% of input tokens hit
 GreenPT's prompt cache at EUR 0.022/M, because one-email-per-call resends an
 identical system prompt every time. That same repetition is what blew

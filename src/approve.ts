@@ -9,13 +9,17 @@
 
 import { requirePromptBucket } from "./config.js";
 import { getJson, putJson } from "./s3-json.js";
-import { CURRENT_PROMPT_KEY, getCurrentPrompt } from "./current-prompt.js";
-import { HISTORY_INDEX_KEY, historyRecordKey, type VersionRecord } from "./history.js";
+import { currentPromptKey, getCurrentPrompt } from "./current-prompt.js";
+import { historyIndexKey, historyRecordKey, type VersionRecord } from "./history.js";
+import { DEFAULT_STAGE, type StageKey } from "./stages.js";
 import type { CorrectionResult } from "./evaluate.js";
 
 export interface ApproveCandidate {
   version: string;
   prompt: string;
+  // Which round's version line this approval advances. Omitted means triage,
+  // so an existing caller keeps working unchanged.
+  stage?: StageKey;
 }
 
 export interface ApproveEvaluation {
@@ -40,11 +44,12 @@ export async function approvePromptDiff(
   meta: ApproveMeta
 ): Promise<ApprovePromptDiffResult> {
   const bucket = requirePromptBucket();
+  const stage = candidate.stage ?? DEFAULT_STAGE;
 
   // Read at write time, not caller-supplied, so previousVersion reflects what
   // was live the instant this approval landed -- not what the caller's
   // evaluate_candidate saw earlier in the round.
-  const previous = await getCurrentPrompt().catch(() => null);
+  const previous = await getCurrentPrompt(stage).catch(() => null);
 
   const record: VersionRecord = {
     version: candidate.version,
@@ -57,12 +62,12 @@ export async function approvePromptDiff(
     replay: evaluation,
   };
 
-  await putJson(bucket, CURRENT_PROMPT_KEY, { version: candidate.version, prompt: candidate.prompt });
-  await putJson(bucket, historyRecordKey(candidate.version), record);
+  await putJson(bucket, currentPromptKey(stage), { version: candidate.version, prompt: candidate.prompt });
+  await putJson(bucket, historyRecordKey(candidate.version, stage), record);
 
   let index: string[];
   try {
-    index = await getJson<string[]>(bucket, HISTORY_INDEX_KEY);
+    index = await getJson<string[]>(bucket, historyIndexKey(stage));
   } catch (err) {
     if (err instanceof Error && err.name === "NoSuchKey") {
       index = [];
@@ -71,7 +76,7 @@ export async function approvePromptDiff(
     }
   }
   index.push(candidate.version);
-  await putJson(bucket, HISTORY_INDEX_KEY, index);
+  await putJson(bucket, historyIndexKey(stage), index);
 
   return { written: true, version: candidate.version };
 }

@@ -37,19 +37,31 @@ destination.
    newest first, via `Email/query` + `Email/get`. Full body text (plain, or
    HTML converted via `html-to-text`) and attachment file names (metadata only
    — content is never fetched), not just a preview snippet.
-2. **Classify** (`classify.ts`) — one model call per email, returning
-   `{category, notify}`. See "Classification" below.
-3. **Act** (`actions.ts`) — `planActions` maps each classification to a
-   destination + `$ai-<promptVersion>-<category>` keyword (pure, no I/O);
+2. **Round 1 — phishing filter** (`phish.ts`) — one model call per email,
+   returning `{verdict}`, over a computed evidence block (`evidence.ts`:
+   merged Fastmail authentication results, Hide My Email relay decoding,
+   links, hidden text). A `phishing` verdict goes straight to
+   `Inbox/Suspicious` and leaves the pipeline; only `clean` mail reaches
+   round 2. Two properties are structural rather than prompt-enforced:
+   suspicious mail can never reach the notify decision, and a round-1 failure
+   leaves the email in `Inbox/Triage` unclassified, for the next run.
+3. **Round 2 — classify** (`classify.ts`) — one model call per clean email,
+   returning `{category, notify}`. See "Classification" below.
+4. **Act** (`actions.ts`) — `planActions` maps each classification to a
+   destination + `$ai-<promptVersion>-<category>` keyword (pure, no I/O),
+   once per round so each stamps its own version; mail round 2 files also
+   carries round 1's `$ai-<phVersion>-clean`, which is what makes a round-1
+   false negative detectable later;
    `applyMoves` performs the `Email/set` writes, batched, with per-email
    failure isolation. A move is a **patch** on `mailboxIds`
    (`{"mailboxIds/<triageId>": null, "mailboxIds/<destId>": true}`), not a
    replace, since an email can belong to several mailboxes. The keyword rides
    in the same patch, so a move and its tag succeed or fail together.
-4. **Notify** (`notify.ts`) — after a confirmed move, a Pushover push
+5. **Notify** (`notify.ts`) — after a confirmed move, a Pushover push
    (priority `0`) for any email the model marked `notify: true`, regardless of
-   category. There is no category gate in code; restraint (e.g. never pushing
-   for `suspicious`) lives entirely in the prompt.
+   category. There is no category gate in code, and none is needed for
+   suspicious mail any more: a phishing verdict never reaches round 2, so it
+   never produces a notify decision at all.
 
 Crash/re-run safety is by construction: a move is the only state change that
 removes an email from `Inbox/Triage`, so a re-run just re-fetches whatever is
@@ -182,6 +194,9 @@ src/
   jmap-session.ts        -- Session type, bootstrapSession, jmapRequest
   mailboxes.ts           -- MAILBOX_SPECS (single source of truth), resolveMailboxes
   fetch-emails.ts        -- fetchTriageEmails, fetchEmailsByIds, body/attachment extraction
+  stages.ts              -- STAGE_SPECS: the two rounds, their S3 prefixes and version lines
+  evidence.ts            -- buildEvidence: auth/relay/link facts from headers, pure
+  phish.ts               -- judgePhishing (round 1)
   classify.ts            -- ClassifierConfig, classifyEmail (GreenPT)
   model-pacing.ts        -- per-model concurrency + delay, runPaced()
   actions.ts             -- destinationsFor, planActions, applyMoves

@@ -56,7 +56,7 @@ function sleep(ms: number) {
 // Retries on 429 -- except the ones that aren't throttling: GreenPT returns
 // 402 on exhausted credits, but some gateways signal an empty balance as a
 // 429 with insufficient_quota. Backing off will not add credit.
-async function invokeOpenAICompatible(
+export async function invokeOpenAICompatible(
   config: ClassifierConfig,
   systemText: string,
   userContent: string,

@@ -4,19 +4,25 @@
 
 import { requirePromptBucket } from "./config.js";
 import { getJson } from "./s3-json.js";
+import { DEFAULT_STAGE, stageSpec, type StageKey } from "./stages.js";
 
-export const CURRENT_PROMPT_KEY = "current.json";
+// Round 2 keeps the bare key it has always had, so its object never moves;
+// round 1 lands under phish/.
+export function currentPromptKey(stage: StageKey = DEFAULT_STAGE): string {
+  return `${stageSpec(stage).s3Prefix}current.json`;
+}
 
 export interface CurrentPrompt {
   version: string;
   prompt: string;
 }
 
-export async function getCurrentPrompt(): Promise<CurrentPrompt> {
+export async function getCurrentPrompt(stage: StageKey = DEFAULT_STAGE): Promise<CurrentPrompt> {
   const bucket = requirePromptBucket();
-  const data = await getJson<Partial<CurrentPrompt>>(bucket, CURRENT_PROMPT_KEY);
+  const key = currentPromptKey(stage);
+  const data = await getJson<Partial<CurrentPrompt>>(bucket, key);
   if (typeof data.version !== "string" || typeof data.prompt !== "string") {
-    throw new Error(`Malformed s3://${bucket}/${CURRENT_PROMPT_KEY}: expected {version, prompt}`);
+    throw new Error(`Malformed s3://${bucket}/${key}: expected {version, prompt}`);
   }
   return { version: data.version, prompt: data.prompt };
 }

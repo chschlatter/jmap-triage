@@ -4,7 +4,11 @@
 import { MAILBOX_SPECS, type MailboxOverrides } from "./mailboxes.js";
 import type { ClassifierConfig } from "./classify.js";
 
-const DEFAULT_LIMIT = 20;
+// Halved when triage became two rounds: each email now costs two model calls,
+// so 10 emails is the same 20 calls -- two waves at the current concurrency,
+// which still fits TriageFunction's 240s budget at the provider's slow-day
+// latency (DECISIONS.md).
+const DEFAULT_LIMIT = 10;
 
 export async function loadEnvFile(path = ".env") {
   const fs = await import("node:fs/promises");

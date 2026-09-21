@@ -4,11 +4,14 @@
 
 import { requirePromptBucket } from "./config.js";
 import { getJson } from "./s3-json.js";
+import { DEFAULT_STAGE, stageSpec, type StageKey } from "./stages.js";
 import type { CorrectionResult } from "./evaluate.js";
 
-export const HISTORY_INDEX_KEY = "history/index.json";
-export function historyRecordKey(version: string): string {
-  return `history/${version}.json`;
+export function historyIndexKey(stage: StageKey = DEFAULT_STAGE): string {
+  return `${stageSpec(stage).s3Prefix}history/index.json`;
+}
+export function historyRecordKey(version: string, stage: StageKey = DEFAULT_STAGE): string {
+  return `${stageSpec(stage).s3Prefix}history/${version}.json`;
 }
 
 export interface VersionRecord {
@@ -27,14 +30,16 @@ export interface GetVersionHistoryParams {
   // Only versions approved after this one, for paging a long history. Most
   // callers omit it and get everything, most-recent-first.
   sinceVersion?: string;
+  stage?: StageKey;
 }
 
 export async function getVersionHistory(params: GetVersionHistoryParams = {}): Promise<VersionRecord[]> {
   const bucket = requirePromptBucket();
+  const stage = params.stage ?? DEFAULT_STAGE;
 
   let index: string[];
   try {
-    index = await getJson<string[]>(bucket, HISTORY_INDEX_KEY);
+    index = await getJson<string[]>(bucket, historyIndexKey(stage));
   } catch (err) {
     // No approval written yet -- a normal starting state, not an error. Any
     // other failure (permissions, malformed JSON) still propagates.
@@ -54,5 +59,5 @@ export async function getVersionHistory(params: GetVersionHistoryParams = {}): P
     versions = versions.slice(0, params.limit);
   }
 
-  return Promise.all(versions.map((v) => getJson<VersionRecord>(bucket, historyRecordKey(v))));
+  return Promise.all(versions.map((v) => getJson<VersionRecord>(bucket, historyRecordKey(v, stage))));
 }

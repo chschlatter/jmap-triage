@@ -7,12 +7,14 @@
 import { requireFastmailToken, requireModelConfig } from "./config.js";
 import { getCurrentPrompt } from "./current-prompt.js";
 import { getVersionHistory } from "./history.js";
-import { classifyEmail } from "./classify.js";
+import { classifyEmail, type ClassifierConfig } from "./classify.js";
+import { judgePhishing } from "./phish.js";
 import { runPaced } from "./model-pacing.js";
-import { fetchEmailsByIds } from "./fetch-emails.js";
+import { fetchEmailsByIds, type TriageEmail } from "./fetch-emails.js";
 import { bootstrapSession } from "./jmap-session.js";
 import { scanKeywordState, type KeywordMatch, type KeywordMismatch } from "./keyword-scan.js";
-import { MAILBOX_SPECS } from "./mailboxes.js";
+import { MAILBOX_SPECS, categoriesForStage } from "./mailboxes.js";
+import { CLEAN_VERDICT, DEFAULT_STAGE, PHISHING_CATEGORY, stageSpec, type StageKey } from "./stages.js";
 
 // Sized to leave margin under Claude Desktop's hard, non-configurable 240s
 // timeout on remote MCP tool calls as the mailbox grows. Past fixes are
@@ -33,6 +35,10 @@ const JSON_REPLY_INSTRUCTION = /reply with only a json array/i;
 // category or changes the formatting should fail and get a human look.
 const CATEGORY_BULLET = /^-\s*"([a-z]+)":/gm;
 
+// Round 1 has no CATEGORY section -- it ends with a verdict union instead, so
+// its vocabulary is read off the quoted alternatives in that closing line.
+const VERDICT_LITERAL = /"verdict"\s*:\s*((?:"[a-z]+"\s*\|?\s*)+)/;
+
 function extractCategoryNames(promptText: string): Set<string> {
   const names = new Set<string>();
   for (const match of promptText.matchAll(CATEGORY_BULLET)) {
@@ -41,8 +47,22 @@ function extractCategoryNames(promptText: string): Set<string> {
   return names;
 }
 
-function expectedCategoryNames(): Set<string> {
-  return new Set(MAILBOX_SPECS.flatMap((s) => (s.category ? [s.category as string] : [])));
+function extractVerdictNames(promptText: string): Set<string> {
+  const names = new Set<string>();
+  const block = promptText.match(VERDICT_LITERAL)?.[1] ?? "";
+  for (const match of block.matchAll(/"([a-z]+)"/g)) names.add(match[1]);
+  return names;
+}
+
+function extractVocabulary(promptText: string, stage: StageKey): Set<string> {
+  return stage === "phish" ? extractVerdictNames(promptText) : extractCategoryNames(promptText);
+}
+
+// Round 2's vocabulary is the folder map filtered to its own stage, so
+// removing `suspicious` from round 2 is a MAILBOX_SPECS edit, not one here.
+function expectedVocabulary(stage: StageKey): Set<string> {
+  const spec = stageSpec(stage);
+  return new Set(spec.vocabulary ? [...spec.vocabulary] : categoriesForStage(stage));
 }
 
 function setsEqual(a: Set<string>, b: Set<string>): boolean {
@@ -74,27 +94,32 @@ export interface EvaluateCandidateResult {
 
 async function runGate(
   candidate: { version: string; prompt: string },
-  category?: string
+  category?: string,
+  stage: StageKey = DEFAULT_STAGE
 ): Promise<{ pass: boolean; reasons: string[]; candidateCategories: string[] }> {
   const reasons: string[] = [];
 
-  const current = await getCurrentPrompt();
+  const current = await getCurrentPrompt(stage);
   if (candidate.version === current.version) {
     reasons.push(`candidate version "${candidate.version}" is the same as the live version -- bump it`);
+  }
+  const { versionPrefix } = stageSpec(stage);
+  if (!candidate.version.startsWith(versionPrefix)) {
+    reasons.push(`candidate version "${candidate.version}" does not start with "${versionPrefix}" -- each stage has its own version line`);
   }
 
   if (!JSON_REPLY_INSTRUCTION.test(candidate.prompt)) {
     reasons.push('trailing "Reply with ONLY a JSON array" instruction is missing or reworded');
   }
 
-  const candidateCategories = extractCategoryNames(candidate.prompt);
-  const expected = expectedCategoryNames();
+  const candidateCategories = extractVocabulary(candidate.prompt, stage);
+  const expected = expectedVocabulary(stage);
   // Against the FULL vocabulary even when `category` scopes the replay: a
   // candidate has to support every category either way.
   if (!setsEqual(candidateCategories, expected)) {
     reasons.push(
-      `category vocabulary mismatch -- candidate has {${[...candidateCategories].sort().join(", ")}}, ` +
-        `folder map has {${[...expected].sort().join(", ")}}`
+      `${stage} vocabulary mismatch -- candidate has {${[...candidateCategories].sort().join(", ")}}, ` +
+        `expected {${[...expected].sort().join(", ")}}`
     );
   }
 
@@ -112,8 +137,8 @@ async function runGate(
 // lists a message as a mismatch forever -- approve_prompt_diff records each
 // approval's replay.fixes precisely so it can be read back here. Most recent
 // record wins if a message appears in several.
-async function buildFixesMap(): Promise<Map<string, string>> {
-  const history = await getVersionHistory({}); // most-recent-first
+async function buildFixesMap(stage: StageKey): Promise<Map<string, string>> {
+  const history = await getVersionHistory({ stage }); // most-recent-first
   const map = new Map<string, string>();
   for (const record of [...history].reverse()) {
     for (const fix of record.replay?.fixes ?? []) {
@@ -179,14 +204,41 @@ function isCorrectionResult(row: CorrectionResult | null): row is CorrectionResu
   return row !== null;
 }
 
+// Both rounds answer with one label per email, so the replay below is the
+// same shape either way -- only which model call produces the label, and how
+// a folder maps back to ground truth, differ by stage.
+function judgeFor(stage: StageKey, model: ClassifierConfig) {
+  if (stage === "phish") {
+    return async (email: TriageEmail, prompt: string) => {
+      const outcome = await judgePhishing(model, email, prompt);
+      return "error" in outcome ? outcome : { id: outcome.id, category: outcome.verdict };
+    };
+  }
+  return async (email: TriageEmail, prompt: string) => {
+    const outcome = await classifyEmail(model, email, prompt);
+    return "error" in outcome ? outcome : { id: outcome.id, category: outcome.category };
+  };
+}
+
+// Round 1's vocabulary is {phishing, clean} but its keyword and folder are
+// "suspicious" -- every other folder simply means the message wasn't phishing.
+function groundTruthFor(stage: StageKey, folderCategory: string): string {
+  if (stage !== "phish") return folderCategory;
+  return folderCategory === PHISHING_CATEGORY ? "phishing" : CLEAN_VERDICT;
+}
+
 async function replay(
   candidatePrompt: string,
-  category?: string
+  category: string | undefined,
+  stage: StageKey
 ): Promise<{ corrections: CorrectionResult[]; regressions: CorrectionResult[] }> {
-  const [{ matches, mismatches }, fixesMap] = await Promise.all([scanKeywordState(), buildFixesMap()]);
+  const [{ matches, mismatches }, fixesMap] = await Promise.all([scanKeywordState(), buildFixesMap(stage)]);
 
-  const scopedMismatches = category ? mismatches.filter((m) => m.predictedCategory === category) : mismatches;
-  const scopedMatches = category ? matches.filter((m) => m.category === category) : matches;
+  const stageMismatches = mismatches.filter((m) => m.stage === stage);
+  const stageMatches = matches.filter((m) => m.stage === stage);
+
+  const scopedMismatches = category ? stageMismatches.filter((m) => m.predictedCategory === category) : stageMismatches;
+  const scopedMatches = category ? stageMatches.filter((m) => m.category === category) : stageMatches;
 
   // Against the FULL fixes map regardless of scope: whether a mismatch is
   // resolved doesn't depend on which category this call is testing.
@@ -210,17 +262,19 @@ async function replay(
   const session = await bootstrapSession(token);
   const emails = await fetchEmailsByIds(session, idsToFetch);
   const emailById = new Map(emails.map((e) => [e.id, e]));
+  const judge = judgeFor(stage, model);
 
   // One email per call against the production model id: a replay is only
   // meaningful if it matches what runtime actually asks of the model.
   const correctionResults = await runPaced(openCorrections, model.modelId, async (correction): Promise<CorrectionResult | null> => {
     const email = emailById.get(correction.messageId);
-    const actualCategory = actualCategoryFromMismatch(correction);
+    const folderCategory = actualCategoryFromMismatch(correction);
     // No body or no resolvable ground truth -- nothing meaningful to report,
     // so drop this row rather than failing the whole list.
-    if (!email || actualCategory === null) return null;
+    if (!email || folderCategory === null) return null;
+    const actualCategory = groundTruthFor(stage, folderCategory);
 
-    const outcome = await classifyEmail(model, email, candidatePrompt);
+    const outcome = await judge(email, candidatePrompt);
     if ("error" in outcome) {
       return {
         id: correction.messageId,
@@ -246,25 +300,26 @@ async function replay(
   const counterweightResults = await runPaced(counterweight, model.modelId, async (cw): Promise<CorrectionResult | null> => {
     const email = emailById.get(cw.id);
     if (!email) return null;
+    const expectedCategory = groundTruthFor(stage, cw.expectedCategory);
 
-    const outcome = await classifyEmail(model, email, candidatePrompt);
+    const outcome = await judge(email, candidatePrompt);
     if ("error" in outcome) {
       // Can't verify the guard still holds -- flag it rather than drop it.
       return {
         id: cw.id,
         subject: email.subject,
-        expectedCategory: cw.expectedCategory,
+        expectedCategory,
         actualCategory: "(error)",
         status: "error",
         error: outcome.error,
       };
     }
 
-    if (outcome.category === cw.expectedCategory) return null;
+    if (outcome.category === expectedCategory) return null;
     return {
       id: cw.id,
       subject: email.subject,
-      expectedCategory: cw.expectedCategory,
+      expectedCategory,
       actualCategory: outcome.category,
       status: "regressed",
     };
@@ -283,14 +338,15 @@ async function replay(
 // the caller's job: call once per category, or omit it.
 export async function evaluateCandidate(
   candidate: { version: string; prompt: string },
-  category?: string
+  category?: string,
+  stage: StageKey = DEFAULT_STAGE
 ): Promise<EvaluateCandidateResult> {
-  const gate = await runGate(candidate, category);
+  const gate = await runGate(candidate, category, stage);
   if (!gate.pass) {
     return { gate, fixes: [], corrections: [], regressions: [] };
   }
 
-  const { corrections, regressions } = await replay(candidate.prompt, category);
+  const { corrections, regressions } = await replay(candidate.prompt, category, stage);
   const fixes = corrections.filter((c) => c.status === "fixed");
   return { gate, fixes, corrections, regressions };
 }

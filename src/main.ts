@@ -17,10 +17,14 @@ import { bootstrapSession } from "./jmap-session.js";
 import { resolveMailboxes } from "./mailboxes.js";
 import { fetchTriageEmails } from "./fetch-emails.js";
 import { classifyEmail, type ClassifierConfig } from "./classify.js";
+import { judgePhishing } from "./phish.js";
 import { applyMoves, destinationsFor, planActions } from "./actions.js";
 import { sendPushoverNotification } from "./notify.js";
 import { getConcurrency, runPaced } from "./model-pacing.js";
 import { getCurrentPrompt } from "./current-prompt.js";
+import { CLEAN_VERDICT, PHISHING_CATEGORY } from "./stages.js";
+import type { TriageEmail } from "./fetch-emails.js";
+import type { ClassificationOutcome } from "./classify.js";
 
 // An empty "Move failures" section is noise, not information.
 function printTable(title: string, rows: object[]) {
@@ -35,13 +39,15 @@ export interface PipelineConfig {
   pushover: PushoverConfig | null;
   mailboxOverrides: MailboxOverrides;
   options: CliOptions;
-  // The S3-fetched current.json. Required, not optional -- there is no
-  // offline default, so every caller fetches it before building this config.
+  // The S3-fetched current.json for each round. Required, not optional --
+  // there is no offline default, so every caller fetches both before
+  // building this config.
   prompt: { version: string; text: string };
+  phishPrompt: { version: string; text: string };
 }
 
 export async function runPipeline(config: PipelineConfig) {
-  const { token, model, pushover, mailboxOverrides, options, prompt } = config;
+  const { token, model, pushover, mailboxOverrides, options, prompt, phishPrompt } = config;
 
   const session = await bootstrapSession(token);
   const mailboxes = await resolveMailboxes(session, mailboxOverrides);
@@ -53,18 +59,56 @@ export async function runPipeline(config: PipelineConfig) {
     return;
   }
 
-  // --- Classify: one call per email, paced by runPaced() -- the same policy
-  // evaluate_candidate's replay uses, so a model change stays safe in both.
+  const emailById = new Map(emails.map((e) => [e.id, e]));
 
-  console.log(`Classifying ${emails.length} email(s) via GreenPT ${model.modelId} (concurrency: ${getConcurrency()})...`);
-  const outcomes = await runPaced(
+  // --- Round 1: phishing filter. Runs over everything, and only what it
+  // calls clean reaches round 2 -- so a phishing verdict can never reach the
+  // notify decision, and a round-1 failure can never be classified.
+
+  console.log(`Round 1: checking ${emails.length} email(s) for phishing via ${model.modelId} ${phishPrompt.version} (concurrency: ${getConcurrency()})...`);
+  const phishOutcomes = await runPaced(
     emails,
     model.modelId,
-    (email) => classifyEmail(model, email, prompt.text),
-    (_outcome, _email, i) => console.log(`[${i + 1}/${emails.length}] classified`)
+    (email) => judgePhishing(model, email, phishPrompt.text),
+    (_o, _email, i) => console.log(`[${i + 1}/${emails.length}] checked`)
   );
 
-  const emailById = new Map(emails.map((e) => [e.id, e]));
+  const phishing: TriageEmail[] = [];
+  const clean: TriageEmail[] = [];
+  const phishFailures: Array<{ email: TriageEmail; error: string }> = [];
+  const signalFor = new Map<string, string>();
+  for (const outcome of phishOutcomes) {
+    const email = emailById.get(outcome.id);
+    if (!email) continue;
+    if ("error" in outcome) {
+      phishFailures.push({ email, error: outcome.error });
+      continue;
+    }
+    signalFor.set(email.id, outcome.signal);
+    if (outcome.verdict === "phishing") phishing.push(email);
+    else clean.push(email);
+  }
+
+  printTable(
+    "Round 1: phishing",
+    // signal is shown, never acted on -- see phish.ts.
+    phishing.map((e) => ({ emailId: e.id, subject: e.subject, from: e.from, signal: signalFor.get(e.id) }))
+  );
+  printTable(
+    "Round 1 failures (left in Inbox/Triage, not classified)",
+    phishFailures.map((f) => ({ emailId: f.email.id, subject: f.email.subject, error: f.error }))
+  );
+
+  // --- Round 2: category triage, clean mail only ---
+
+  console.log(`Round 2: classifying ${clean.length} clean email(s) via ${model.modelId} ${prompt.version}...`);
+  const outcomes = await runPaced(
+    clean,
+    model.modelId,
+    (email) => classifyEmail(model, email, prompt.text),
+    (_outcome, _email, i) => console.log(`[${i + 1}/${clean.length}] classified`)
+  );
+
   printTable(
     "Triage classification",
     outcomes.flatMap((o) =>
@@ -77,8 +121,27 @@ export async function runPipeline(config: PipelineConfig) {
   );
 
   // --- Act: plan moves, apply only with --apply ---
+  //
+  // planActions is called once per round rather than gaining a stage
+  // parameter: it is pure, and each round stamps its own version.
 
-  const { planned, skipped } = planActions(emails, outcomes, destinations, prompt.version);
+  const phishPlan = planActions(
+    phishing,
+    // A phishing verdict maps to exactly one destination, and never notifies.
+    phishing.map((e): ClassificationOutcome => ({ id: e.id, category: PHISHING_CATEGORY, notify: false })),
+    destinations,
+    phishPrompt.version
+  );
+  const triagePlan = planActions(clean, outcomes, destinations, prompt.version, [
+    `$ai-${phishPrompt.version}-${CLEAN_VERDICT}`,
+  ]);
+
+  const planned = [...phishPlan.planned, ...triagePlan.planned];
+  const skipped = [
+    ...phishFailures.map((f) => ({ email: f.email, reason: `round 1: ${f.error}` })),
+    ...phishPlan.skipped,
+    ...triagePlan.skipped,
+  ];
 
   if (!options.apply) {
     console.log("\n--- Dry run: no writes performed (pass --apply to move mail and notify) ---");
@@ -89,6 +152,7 @@ export async function runPipeline(config: PipelineConfig) {
         category: a.category,
         destination: a.destination.path,
         keyword: a.keyword,
+        extraKeywords: (a.extraKeywords ?? []).join(", "),
         wouldNotify: a.notify,
       }))
     );
@@ -156,7 +220,7 @@ export async function main() {
   const model = requireModelConfig();
   const pushover: PushoverConfig | null = options.notify ? requirePushoverConfig() : null;
   // No local fallback prompt, so a CLI run needs PROMPT_BUCKET and S3 reads.
-  const current = await getCurrentPrompt();
+  const [current, phish] = await Promise.all([getCurrentPrompt("triage"), getCurrentPrompt("phish")]);
 
   await runPipeline({
     token,
@@ -165,5 +229,6 @@ export async function main() {
     mailboxOverrides: readMailboxOverrides(),
     options,
     prompt: { version: current.version, text: current.prompt },
+    phishPrompt: { version: phish.version, text: phish.prompt },
   });
 }

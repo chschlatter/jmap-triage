@@ -42,6 +42,10 @@ export interface PlannedAction {
   // that the email was flagged for a push, not that Pushover delivery
   // succeeded -- main.ts's notify stage fails independently of this.
   notifiedKeyword: string;
+  // Stamps from an earlier round. Mail that round 2 files carries round 1's
+  // $ai-<phVersion>-clean too, which is the only way a round-1 false
+  // negative becomes detectable later (DESIGN-v8 SS3.5).
+  extraKeywords?: string[];
 }
 
 export interface SkippedEmail {
@@ -66,7 +70,8 @@ export function planActions(
   emails: TriageEmail[],
   outcomes: ClassificationOutcome[],
   destinations: Record<string, Destination>,
-  promptVersion: string
+  promptVersion: string,
+  extraKeywords: string[] = []
 ): { planned: PlannedAction[]; skipped: SkippedEmail[] } {
   const emailById = new Map(emails.map((e) => [e.id, e]));
   const planned: PlannedAction[] = [];
@@ -94,6 +99,7 @@ export function planActions(
       destination,
       keyword: aiKeywordFor(promptVersion, outcome.category),
       notifiedKeyword: aiNotifiedKeyword(promptVersion),
+      extraKeywords,
     });
   }
 
@@ -137,6 +143,9 @@ export async function applyMoves(
       };
       if (action.notify) {
         patch[`keywords/${action.notifiedKeyword}`] = true;
+      }
+      for (const extra of action.extraKeywords ?? []) {
+        patch[`keywords/${extra}`] = true;
       }
       update[action.email.id] = patch;
     }

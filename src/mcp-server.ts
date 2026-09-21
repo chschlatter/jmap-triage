@@ -20,12 +20,16 @@ import { getVersionHistory } from "./history.js";
 import { getTriageReport } from "./report.js";
 import { evaluateCandidate } from "./evaluate.js";
 import { approvePromptDiff } from "./approve.js";
+import { STAGE_KEYS, type StageKey } from "./stages.js";
 
 const SERVER_INFO = { name: "jmap-triage-mcp", version: "1.0.0" };
 
 function textResult(value: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] };
 }
+
+// Shared by every stage-aware tool, so the two round names are spelled once.
+const STAGE_ENUM = z.enum(STAGE_KEYS as [StageKey, ...StageKey[]]);
 
 function errorResult(err: unknown) {
   const message = err instanceof Error ? err.message : String(err);
@@ -43,12 +47,12 @@ export function createMcpServer(): McpServer {
     {
       title: "Get current prompt",
       description:
-        "Returns current.json: {version, prompt} -- the live baseline every draft is built against. Always re-fetch at the start of each round; never assume an earlier round's version is still current.",
-      inputSchema: {},
+        "Returns {version, prompt} -- the live baseline every draft is built against. Triage has two rounds with independent version lines: `stage: \"triage\"` (default) is the category classifier (v-series), `stage: \"phish\"` is the round-1 phishing filter (ph-series) that runs first and decides Inbox/Suspicious. Always re-fetch at the start of each round; never assume an earlier round's version is still current.",
+      inputSchema: { stage: STAGE_ENUM.optional() },
     },
-    async () => {
+    async ({ stage }) => {
       try {
-        return textResult(await getCurrentPrompt());
+        return textResult(await getCurrentPrompt(stage));
       } catch (err) {
         return errorResult(err);
       }
@@ -64,11 +68,12 @@ export function createMcpServer(): McpServer {
       inputSchema: {
         limit: z.number().int().positive().optional(),
         sinceVersion: z.string().optional(),
+        stage: STAGE_ENUM.optional(),
       },
     },
-    async ({ limit, sinceVersion }) => {
+    async ({ limit, sinceVersion, stage }) => {
       try {
-        return textResult(await getVersionHistory({ limit, sinceVersion }));
+        return textResult(await getVersionHistory({ limit, sinceVersion, stage }));
       } catch (err) {
         return errorResult(err);
       }
@@ -80,7 +85,7 @@ export function createMcpServer(): McpServer {
     {
       title: "Get triage report",
       description:
-        "Queries every mailbox for $ai-* keywords, compares the stamped category to the email's current mailbox. Returns per-category mismatch ratios and the mismatch refs. notify is shown per-row, never folded into the ratios.",
+        "Queries every mailbox for $ai-* keywords, compares the stamped verdict or category to the email's current mailbox. Returns per-category mismatch ratios and refs for round 2, plus a separate `phish` block for round 1 with its false positives (stamped suspicious, filed elsewhere) and false negatives (stamped clean, now in Suspicious) -- the two rounds are never mixed into one ratio, since they answer different questions. notify is shown per-row, never folded into the ratios.",
       inputSchema: {
         since: z.string().optional(),
       },
@@ -99,16 +104,17 @@ export function createMcpServer(): McpServer {
     {
       title: "Evaluate candidate prompt",
       description:
-        "Read-only. Static gate (version bump, JSON-reply shape intact, category vocabulary set-equal to the folder map -- always the FULL vocabulary, regardless of `category`), then, only if it passes, a replay against open corrections and a counterweight sample derived live from JMAP keyword state and prior approvals. No stored corpus. Returns {gate, fixes, corrections, regressions}. gate.candidateCategories echoes what was parsed out of the candidate's CATEGORY section, pass or fail. corrections lists every open mismatch replayed, with status 'fixed' | 'unfixed' | 'error'; fixes is just the 'fixed' subset. When fixes is empty, read corrections rather than assuming nothing happened -- 'unfixed' means still misclassifying (actualCategory shows what the model said), 'error' means the classify call itself failed. regressions lists only counterweight rows that broke or errored. Pass `category` to scope the replay to one category -- recommended when the diff touches only that category's wording, the common case -- or omit it for a full sweep. Either way this makes real classification calls, so a few minutes is expected, not a hang.",
+        "Read-only. Static gate (version bump, version prefix matching the stage, JSON-reply shape intact, vocabulary set-equal to what the stage allows -- always the FULL vocabulary, regardless of `category`), then, only if it passes, a replay against open corrections and a counterweight sample derived live from JMAP keyword state and prior approvals. No stored corpus. `stage` selects which round is being evaluated: \"triage\" (default) replays category classification against the four category folders; \"phish\" replays the round-1 phishing filter, where ground truth is simply whether the message now sits in Inbox/Suspicious. Returns {gate, fixes, corrections, regressions}. gate.candidateCategories echoes the vocabulary parsed out of the candidate, pass or fail. corrections lists every open mismatch replayed, with status 'fixed' | 'unfixed' | 'error'; fixes is just the 'fixed' subset. When fixes is empty, read corrections rather than assuming nothing happened -- 'unfixed' means still misclassifying (actualCategory shows what the model said), 'error' means the model call itself failed. regressions lists only counterweight rows that broke or errored. Pass `category` to scope the replay -- recommended when the diff touches only that category's wording, the common case -- or omit it for a full sweep. Either way this makes real model calls, so a few minutes is expected, not a hang.",
       inputSchema: {
         version: z.string(),
         prompt: z.string(),
         category: z.string().optional(),
+        stage: STAGE_ENUM.optional(),
       },
     },
-    async ({ version, prompt, category }) => {
+    async ({ version, prompt, category, stage }) => {
       try {
-        return textResult(await evaluateCandidate({ version, prompt }, category));
+        return textResult(await evaluateCandidate({ version, prompt }, category, stage));
       } catch (err) {
         return errorResult(err);
       }
@@ -120,9 +126,9 @@ export function createMcpServer(): McpServer {
     {
       title: "Approve prompt diff",
       description:
-        "PERFORMS A LIVE WRITE. Writes current.json (the new live pointer) and an immutable history/<version>.json record. Only call this after the human reviewing this session has explicitly approved the candidate -- takes the evaluate_candidate result that justified the approval as input, not re-derived, so a record can't claim a replay outcome that didn't actually happen.",
+        "PERFORMS A LIVE WRITE. Writes the stage's current.json (the new live pointer) and an immutable history/<version>.json record beside it. `candidate.stage` picks the version line -- \"triage\" (default) or \"phish\" -- and the two are written independently, so approving one round never re-versions the other. Only call this after the human reviewing this session has explicitly approved the candidate -- takes the evaluate_candidate result that justified the approval as input, not re-derived, so a record can't claim a replay outcome that didn't actually happen.",
       inputSchema: {
-        candidate: z.object({ version: z.string(), prompt: z.string() }),
+        candidate: z.object({ version: z.string(), prompt: z.string(), stage: STAGE_ENUM.optional() }),
         evaluation: z.object({
           fixes: z.array(z.record(z.string(), z.unknown())),
           regressions: z.array(z.record(z.string(), z.unknown())),

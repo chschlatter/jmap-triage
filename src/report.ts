@@ -6,7 +6,8 @@
 import { requireFastmailToken } from "./config.js";
 import { getKnownPromptVersions, scanKeywordState } from "./keyword-scan.js";
 import { bootstrapSession, jmapRequest, CORE, MAIL, type Session } from "./jmap-session.js";
-import { MAILBOX_SPECS } from "./mailboxes.js";
+import { categoriesForStage } from "./mailboxes.js";
+import { CLEAN_VERDICT, PHISHING_CATEGORY, type StageKey } from "./stages.js";
 
 export interface TriageReportParams {
   // Not wired up: the shared scan has no date-bound support. Kept on the
@@ -24,6 +25,16 @@ export interface TriageReportMismatch {
   predictedCategory: string;
   actualFolder: string;
   promptVersion: string;
+  stage: StageKey;
+}
+
+// Round 1's two error directions, which are not comparable to a round-2
+// category mismatch: a false positive buried real mail in Suspicious, a
+// false negative let phishing through to triage.
+export interface PhishReport {
+  falsePositives: TriageReportMismatch[];
+  falseNegatives: TriageReportMismatch[];
+  checked: number;
 }
 
 export interface TriageReportNotifyRow {
@@ -35,6 +46,7 @@ export interface TriageReport {
   ratios: Record<string, TriageReportRatio>;
   notifyRows: TriageReportNotifyRow[];
   mismatches: TriageReportMismatch[];
+  phish: PhishReport;
 }
 
 async function fetchNotifiedIds(session: Session, versions: string[]): Promise<Set<string>> {
@@ -50,17 +62,32 @@ async function fetchNotifiedIds(session: Session, versions: string[]): Promise<S
 }
 
 export async function getTriageReport(_params: TriageReportParams = {}): Promise<TriageReport> {
-  const categories = MAILBOX_SPECS.flatMap((s) => (s.category ? [s.category as string] : []));
+  const categories = categoriesForStage("triage");
 
   const { matches, mismatches } = await scanKeywordState();
 
+  // Round 2's ratios cover round 2's categories only -- mixing a phishing
+  // verdict into them would compare two different questions.
+  const triageMismatches = mismatches.filter((m) => m.stage === "triage");
   const ratios: Record<string, TriageReportRatio> = {};
   for (const c of categories) ratios[c] = { mismatches: 0, total: 0 };
-  for (const m of matches) ratios[m.category].total++;
-  for (const m of mismatches) {
+  for (const m of matches) {
+    if (m.stage === "triage") ratios[m.category].total++;
+  }
+  for (const m of triageMismatches) {
     ratios[m.predictedCategory].total++;
     ratios[m.predictedCategory].mismatches++;
   }
+
+  const phishMismatches = mismatches.filter((m) => m.stage === "phish");
+  const phish: PhishReport = {
+    // Stamped suspicious, now filed somewhere else: round 1 was wrong to
+    // flag it.
+    falsePositives: phishMismatches.filter((m) => m.predictedCategory === PHISHING_CATEGORY),
+    // Stamped clean, now in Suspicious: the user caught what round 1 missed.
+    falseNegatives: phishMismatches.filter((m) => m.predictedCategory === CLEAN_VERDICT),
+    checked: matches.filter((m) => m.stage === "phish").length + phishMismatches.length,
+  };
 
   // Own session, deliberately not shared with scanKeywordState().
   const session = await bootstrapSession(requireFastmailToken());
@@ -73,5 +100,5 @@ export async function getTriageReport(_params: TriageReportParams = {}): Promise
     notify: notifiedIds.has(messageId),
   }));
 
-  return { ratios, notifyRows, mismatches };
+  return { ratios, notifyRows, mismatches: triageMismatches, phish };
 }

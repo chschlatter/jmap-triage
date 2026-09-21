@@ -32,12 +32,16 @@ interface LivePrompt {
 }
 
 // Same caching pattern as secretsPromise, including handler() clearing it on
-// failure so the next invocation retries instead of failing forever.
-let promptPromise: Promise<LivePrompt> | undefined;
+// failure so the next invocation retries instead of failing forever. Both
+// rounds are cached together: a run needs both prompts or neither.
+let promptPromise: Promise<{ triage: LivePrompt; phish: LivePrompt }> | undefined;
 
-async function loadPrompt(): Promise<LivePrompt> {
-  const current = await getCurrentPrompt();
-  return { version: current.version, text: current.prompt };
+async function loadPrompts(): Promise<{ triage: LivePrompt; phish: LivePrompt }> {
+  const [triage, phish] = await Promise.all([getCurrentPrompt("triage"), getCurrentPrompt("phish")]);
+  return {
+    triage: { version: triage.version, text: triage.prompt },
+    phish: { version: phish.version, text: phish.prompt },
+  };
 }
 
 function requireEnv(name: string): string {
@@ -94,8 +98,8 @@ export async function handler(event: LambdaEvent | undefined): Promise<void> {
       throw err;
     });
 
-    promptPromise ??= loadPrompt();
-    const prompt = await promptPromise.catch((err) => {
+    promptPromise ??= loadPrompts();
+    const prompts = await promptPromise.catch((err) => {
       promptPromise = undefined;
       throw err;
     });
@@ -117,7 +121,8 @@ export async function handler(event: LambdaEvent | undefined): Promise<void> {
       pushover,
       mailboxOverrides: readMailboxOverrides(),
       options: { limit, apply, notify: apply },
-      prompt,
+      prompt: prompts.triage,
+      phishPrompt: prompts.phish,
     });
   } catch (err) {
     // Rethrow so the invocation reports as failed -- Lambda's Errors metric
