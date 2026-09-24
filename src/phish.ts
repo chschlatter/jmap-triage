@@ -24,8 +24,14 @@ export type PhishOutcome =
   | { id: string; verdict: PhishVerdict; signal: string }
   | { id: string; error: string };
 
-// Round 1 answers one word; the headroom is for a reasoning model's preamble.
-const PHISH_MAX_TOKENS = 600;
+// Round 1's answer is ~30 tokens; everything else is the reasoning budget.
+// Measured on 14 recent messages: median 594 completion tokens, max 1043,
+// and one LinkedIn notification needed 2072. At 600 this truncated 8 of 14
+// and returned empty content on 7 -- each of those is a round-1 failure that
+// leaves the message in Triage to be retried every schedule tick. Reasoning
+// length does not expand to fill the budget (median held at ~600 when the
+// cap was raised to 3000), so the headroom is free.
+const PHISH_MAX_TOKENS = 3000;
 
 // EVIDENCE first, then the message, explicitly marked untrusted. Exported so
 // eval/ph1 sends a byte-identical request to the pipeline's.

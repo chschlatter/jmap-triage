@@ -11,6 +11,19 @@ const GREENPT_API_URL = "https://api.greenpt.ai/v1/chat/completions";
 const MAX_RETRIES = 5;
 const RETRY_BASE_DELAY_MS = 1000;
 
+// GreenPT's gateway gives up on a hung request at 180s. Waiting for that is
+// pure loss inside TriageFunction's 240s budget: one stuck call would eat it
+// and take the rest of the batch down with it. Cutting at 60s leaves room to
+// retry once and still finish. Measured 2026-09-22: healthy calls have a
+// ~27s median and a 135s worst case, and the timeouts do not correlate with
+// max_tokens -- three sweeps at 1200/1500/2000 came back 24/29, 0/29 and
+// 29/29 timed out, which is the provider's day varying, not the budget.
+const REQUEST_TIMEOUT_MS = 60_000;
+// Far fewer than the 429 ladder: each of these costs a full timeout, and the
+// schedule re-runs every 10 minutes anyway. Failing fast and leaving the mail
+// in Inbox/Triage beats spending the invocation on one message.
+const MAX_TRANSIENT_RETRIES = 2;
+
 export interface ClassifierConfig {
   apiKey: string;
   modelId: string;
@@ -62,27 +75,55 @@ export async function invokeOpenAICompatible(
   userContent: string,
   maxTokens: number
 ): Promise<string> {
+  let transientAttempts = 0;
   for (let attempt = 0; ; attempt++) {
-    const response = await fetch(GREENPT_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${config.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: config.modelId,
-        temperature: 0,
-        max_tokens: maxTokens,
-        messages: [
-          { role: "system", content: systemText },
-          { role: "user", content: userContent },
-        ],
-      }),
-    });
+    let response: Response;
+    try {
+      response = await fetch(GREENPT_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${config.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: config.modelId,
+          temperature: 0,
+          max_tokens: maxTokens,
+          messages: [
+            { role: "system", content: systemText },
+            { role: "user", content: userContent },
+          ],
+        }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (err) {
+      // A timeout or a dropped connection. The request is idempotent
+      // (temperature 0, no state), so retrying is safe.
+      if (++transientAttempts > MAX_TRANSIENT_RETRIES) {
+        throw new Error(`No response from ${GREENPT_API_URL} after ${transientAttempts} attempts: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      await sleep(RETRY_BASE_DELAY_MS * 2 ** attempt);
+      continue;
+    }
 
     if (response.ok) {
-      const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
-      const text = data.choices?.[0]?.message?.content;
+      const data = (await response.json()) as {
+        choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+        usage?: { completion_tokens?: number };
+      };
+      const choice = data.choices?.[0];
+      // A reasoning model that runs out of budget mid-thought returns
+      // finish_reason "length" with empty content, which otherwise surfaces
+      // as "Response was not valid JSON:" followed by nothing. Truncated
+      // output is unusable either way -- say so precisely, because the fix
+      // is a bigger maxTokens, not a prompt change.
+      if (choice?.finish_reason === "length") {
+        throw new Error(
+          `Response truncated at max_tokens=${maxTokens} (${data.usage?.completion_tokens ?? "?"} completion tokens, ` +
+            `${(choice.message?.content ?? "").length} chars of content): the model spent the budget before answering.`
+        );
+      }
+      const text = choice?.message?.content;
       if (typeof text !== "string") {
         throw new Error(`No text content in response from ${GREENPT_API_URL}: ${JSON.stringify(data)}`);
       }
@@ -94,6 +135,14 @@ export async function invokeOpenAICompatible(
     // provider's own message instead of after five sleeps.
     const billing = response.status === 402 || /insufficient_quota|billing_error/.test(body);
     const throttled = response.status === 429 && !billing;
+    // 502/503/504 are the gateway, not the model: the same request usually
+    // succeeds moments later, so they are worth a couple of attempts -- but
+    // on their own ladder, since each one has already cost a timeout.
+    const gateway = response.status >= 500 && response.status < 600;
+    if (gateway && ++transientAttempts <= MAX_TRANSIENT_RETRIES) {
+      await sleep(RETRY_BASE_DELAY_MS * 2 ** attempt);
+      continue;
+    }
     if (!throttled || attempt >= MAX_RETRIES) {
       throw new Error(`API error ${response.status} from ${GREENPT_API_URL}: ${body.slice(0, 300)}`);
     }
