@@ -64,6 +64,23 @@ export const PH1_CASES: Ph1Case[] = [
   // The false-positive counterweight. Several are deliberately the shapes
   // that tripped v5: security notices, payment reminders, expiry warnings.
 
+  // Round 1's first live false positive (2026-09-22). Everything
+  // authenticates -- dmarc=pass p=reject, dkim and spf aligned, BIMI with a
+  // registered mark, spam score 0.0 -- but the plain-text part is a wall of
+  // tracking URLs including the sender's own redirector to its app domain,
+  // with the dot percent-encoded. The model called link-mismatch. Kept as a
+  // permanent guard: a large sender's own tracker is not deception.
+  { id: "StmWSX4cQ3Nc", expected: "clean", note: "social network weekly analytics digest; own domain, own redirector to its own app domain" },
+
+  // Round 1's second live false positive (2026-09-24), and the case ph2 was
+  // written for. Authenticates completely -- dmarc=pass p=reject, dkim and
+  // spf aligned, spam score 0.0 -- and links to the sender's own second
+  // domain for a terms PDF. ph1 called link-mismatch 12/12; ph2 calls it
+  // clean 12/12. Domain ownership is not computable from a message, so the
+  // model was answering from a prior; the fix was to forbid the inference,
+  // not to add data. Moved back to Inbox by hand.
+  { id: "StmU0vT0H8-R", expected: "clean", note: "business network restructuring notice; own domain, own second domain for the terms document" },
+
   { id: "StmXd2vH6D2w", expected: "clean", note: "reply from a small business, arc=pass forwarded" },
   { id: "StmZ5pwE0VxV", expected: "clean", note: "telecom subscription notice from its own subdomain" },
   { id: "Stm_xXHp3WlN", expected: "clean", note: "telecom subscription notice" },
